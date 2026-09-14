@@ -4,7 +4,14 @@ from __future__ import annotations
 import time
 import uuid
 
-from sqlalchemy import BigInteger, LargeBinary, String, Text, UniqueConstraint
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    LargeBinary,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -55,9 +62,11 @@ class LoginState(Base):
 class Presence(Base):
     __tablename__ = "presence"
     username: Mapped[str] = mapped_column(String(32), primary_key=True)
+    online: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     connected_at: Mapped[int] = mapped_column(
         BigInteger, nullable=False, default=lambda: int(time.time())
     )
+    last_seen: Mapped[int | None] = mapped_column(BigInteger, nullable=True, default=None)
 
 
 class OfflineQueue(Base):

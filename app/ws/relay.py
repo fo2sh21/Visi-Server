@@ -217,9 +217,13 @@ async def ws_endpoint(ws: WebSocket):
         return
     await broker.connect(username, ws)
     async with SessionLocal() as db:
-        if await db.get(models.Presence, username) is None:
-            db.add(models.Presence(username=username, connected_at=int(time.time())))
-            await db.commit()
+        now = int(time.time())
+        row = await db.get(models.Presence, username)
+        if row is None:
+            db.add(models.Presence(username=username, online=True, connected_at=now))
+        else:
+            row.online, row.connected_at = True, now
+        await db.commit()
     await flush_queue(username)
     try:
         while True:
@@ -326,9 +330,15 @@ async def ws_endpoint(ws: WebSocket):
     except WebSocketDisconnect:
         pass
     finally:
-        await broker.disconnect(username, ws)
-        async with SessionLocal() as db:
-            row = await db.get(models.Presence, username)
-            if row is not None and not broker.is_online(username):
-                await db.delete(row)
-                await db.commit()
+        # Shielded cleanup: teardown can arrive as task cancellation (client
+        # close under some servers/harnesses, server shutdown), which would
+        # otherwise re-raise at the first await below and skip the DB write.
+        import anyio
+
+        with anyio.CancelScope(shield=True):
+            await broker.disconnect(username, ws)
+            async with SessionLocal() as db:
+                row = await db.get(models.Presence, username)
+                if row is not None and not broker.is_online(username):
+                    row.online, row.last_seen = False, int(time.time())
+                    await db.commit()
