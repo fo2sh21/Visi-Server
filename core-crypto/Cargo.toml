@@ -1,0 +1,40 @@
+[package]
+name = "core-crypto"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "core_crypto"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# UniFFI proc-macro bridge (Kotlin JNI). No .udl file by decision.
+uniffi = { version = "0.32", features = ["cli"] }
+# OPAQUE augmented PAKE (client side). argon2 feature gives Ksf impl;
+# per-call params override to Argon2id m=64MiB,t=3,p=1 (see kdf.rs).
+opaque-ke = { version = "4", features = ["argon2"] }
+argon2 = "0.5"
+rand = { version = "0.8", features = ["getrandom"] }
+zeroize = { version = "1.8", features = ["derive", "serde"] }
+# Signal-compatible primitives (pure Rust). NOTE: crates.io has no official
+# `libsignal-protocol-rust` (upstream is a git repo, AGPL, needs boringssl /
+# protobuf + NDK toolchain). The X3DH + Double-Ratchet engine in signal.rs
+# uses these audited primitives instead; UniFFI API is shaped so the official
+# crate can replace internals without changing Kotlin call sites.
+curve25519-dalek = "4"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+hmac = "0.12"
+sha2 = "0.10"
+subtle = { version = "2", features = ["i128"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+generic-array = "0.14"
+
+[dev-dependencies]
+hex = "0.4"
+
+[features]
+default = []

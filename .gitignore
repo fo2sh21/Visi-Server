@@ -1,0 +1,21 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Local dev databases / caches
+*.db
+*.db-*
+.pytest_cache/
+.mypy_cache/
+
+# Env / secrets
+.env
+*.pem
+*.key
