@@ -1,8 +1,13 @@
-"""M2: INSERT -> push -> DELETE-on-ack. Offline message flushed on connect."""
+"""M2/R2/R3: INSERT -> push -> DELETE-on-owning-ack only; flush never deletes.
+
+- Offline message flushed on connect; ack deletes (hard DELETE, scoped).
+- Drop-before-ack keeps the row: next connect redelivers (at-least-once).
+- Cross-user ack does NOT delete another user's row (R2).
+WS auth is Bearer header only (R1).
+"""
 import asyncio
 import base64
 import time
-import urllib.parse
 
 from fastapi.testclient import TestClient
 
@@ -39,31 +44,99 @@ def _mkclient(tmp_path, monkeypatch):
         yield c, dbmod, models_mod
 
 
+def _tok(user_seed: bytes) -> tuple[str, bytes]:
+    raw = base64.b64encode(user_seed).decode()
+    return raw, tokens.token_hash(base64.b64decode(raw))
+
+
+def _seed(dbmod, models, toks, msgs):
+    async def go():
+        async with dbmod.SessionLocal() as db:
+            now = int(time.time())
+            for user, th in toks:
+                db.add(models.WsToken(token_hash=th, username=user,
+                                      issued_at=now, expires_at=now + 3600))
+            for m in msgs:
+                db.add(models.OfflineQueue(**m))
+            await db.commit()
+
+    asyncio.run(go())
+
+
+def _get(dbmod, models, msg_id):
+    async def go():
+        async with dbmod.SessionLocal() as db:
+            return await db.get(models.OfflineQueue, msg_id)
+
+    return asyncio.run(go())
+
+
 def test_offline_flush_and_ack_deletes(tmp_path, monkeypatch):
     gen = _mkclient(tmp_path, monkeypatch)
     client, dbmod, models = next(gen)
-    tok = base64.b64encode(b"0" * 32).decode()
-    th = tokens.token_hash(base64.b64decode(tok))
-    now = int(time.time())
-
-    async def seed():
-        async with dbmod.SessionLocal() as db:
-            db.add(models.WsToken(token_hash=th, username="bob",
-                                  issued_at=now, expires_at=now + 3600))
-            db.add(models.OfflineQueue(msg_id="m1", to_user="bob",
-                                       from_user="alice", envelope_b64=base64.b64encode(b"ct").decode()))
-            await db.commit()
-
-    asyncio.run(seed())
-    q = urllib.parse.quote(tok, safe="")
-    with client.websocket_connect(f"/api/v1/ws?token={q}") as ws:
-        msg = ws.receive_text()
-        assert '"m1"' in msg  # flushed
+    raw, th = _tok(b"b" * 32)
+    _seed(dbmod, models, [("bob", th)],
+          [{"msg_id": "m1", "to_user": "bob", "from_user": "alice",
+            "envelope_b64": base64.b64encode(b"ct").decode()}])
+    with client.websocket_connect(
+        "/api/v1/ws", headers={"authorization": f"Bearer {raw}"}
+    ) as ws:
+        assert '"m1"' in ws.receive_text()  # flushed
         ws.send_text('{"type": "ack", "msg_id": "m1"}')
         time.sleep(0.5)
+    assert _get(dbmod, models, "m1") is None  # hard DELETE on owning ack
 
-    async def check_gone():
-        async with dbmod.SessionLocal() as db:
-            return await db.get(models.OfflineQueue, "m1")
 
-    assert asyncio.run(check_gone()) is None  # hard DELETE on ack
+def test_drop_before_ack_redelivers(tmp_path, monkeypatch):
+    """R3: flush never deletes — connect, drop without ack, reconnect."""
+    gen = _mkclient(tmp_path, monkeypatch)
+    client, dbmod, models = next(gen)
+    raw, th = _tok(b"c" * 32)
+    _seed(dbmod, models, [("bob", th)],
+          [{"msg_id": "m2", "to_user": "bob", "from_user": "alice",
+            "envelope_b64": base64.b64encode(b"ct").decode()}])
+    hdr = {"authorization": f"Bearer {raw}"}
+    with client.websocket_connect("/api/v1/ws", headers=hdr) as ws:
+        assert '"m2"' in ws.receive_text()
+        # close WITHOUT ack
+    assert _get(dbmod, models, "m2") is not None  # row survives
+    with client.websocket_connect("/api/v1/ws", headers=hdr) as ws2:
+        assert '"m2"' in ws2.receive_text()  # redelivered
+        ws2.send_text('{"type": "ack", "msg_id": "m2"}')
+        time.sleep(0.5)
+    assert _get(dbmod, models, "m2") is None
+
+
+def test_cross_user_ack_does_not_delete(tmp_path, monkeypatch):
+    """R2: mallory acking bob's msg_id must not delete it."""
+    gen = _mkclient(tmp_path, monkeypatch)
+    client, dbmod, models = next(gen)
+    _, th_bob = _tok(b"d" * 32)
+    raw_m, th_m = _tok(b"e" * 32)
+    _seed(dbmod, models, [("bob", th_bob), ("mallory", th_m)],
+          [{"msg_id": "m3", "to_user": "bob", "from_user": "alice",
+            "envelope_b64": base64.b64encode(b"ct").decode()}])
+    with client.websocket_connect(
+        "/api/v1/ws", headers={"authorization": f"Bearer {raw_m}"}
+    ) as ws:
+        ws.send_text('{"type": "ack", "msg_id": "m3"}')
+        time.sleep(0.5)
+    assert _get(dbmod, models, "m3") is not None  # untouched
+
+
+def test_query_token_rejected(tmp_path, monkeypatch):
+    """R1: ?token= is gone — header-only."""
+    gen = _mkclient(tmp_path, monkeypatch)
+    client, dbmod, models = next(gen)
+    raw, th = _tok(b"f" * 32)
+    _seed(dbmod, models, [("bob", th)], [])
+    import urllib.parse
+
+    q = urllib.parse.quote(raw, safe="")
+    try:
+        with client.websocket_connect(f"/api/v1/ws?token={q}"):
+            pass
+        rejected = False
+    except Exception:
+        rejected = True
+    assert rejected

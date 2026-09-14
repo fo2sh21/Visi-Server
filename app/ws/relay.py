@@ -4,6 +4,12 @@ M2: INSERT -> push -> DELETE-on-ack (row lives until ack).
 Postgres-backed for v1 (no Redis). All fan-out goes through Broker so a
 Redis pub/sub impl can replace it later without changing schema/protocol.
 Postgres LISTEN/NOTIFY used only as wakeup ping (msg_id), worker SELECTs row.
+
+Auth: Authorization: Bearer <ws_token_b64> header ONLY (never ?token=).
+Delivery is at-least-once: unacked rows stay queued and are redelivered on
+reconnect. Client contract: dedup by msg_id; on an already-seen msg_id,
+re-send the ack but do NOT reprocess the envelope (else redeliveries loop).
+Acks are idempotent. Only an ack from the owning recipient deletes a row.
 """
 from __future__ import annotations
 
@@ -30,7 +36,8 @@ class Broker:
 
     def __init__(self) -> None:
         self.online: dict[str, set[WebSocket]] = {}
-        self.acks: dict[str, asyncio.Event] = {}
+        # m3: keyed by (username, msg_id) — bare msg_id collides across users.
+        self.acks: dict[tuple[str, str], asyncio.Event] = {}
         self.lock = asyncio.Lock()
 
     async def connect(self, username: str, ws: WebSocket) -> None:
@@ -61,13 +68,13 @@ class Broker:
                 continue
         return ok
 
-    def expect_ack(self, msg_id: str) -> asyncio.Event:
+    def expect_ack(self, username: str, msg_id: str) -> asyncio.Event:
         ev = asyncio.Event()
-        self.acks[msg_id] = ev
+        self.acks[(username, msg_id)] = ev
         return ev
 
-    def resolve_ack(self, msg_id: str) -> None:
-        ev = self.acks.pop(msg_id, None)
+    def resolve_ack(self, username: str, msg_id: str) -> None:
+        ev = self.acks.pop((username, msg_id), None)
         if ev is not None:
             ev.set()
 
@@ -75,16 +82,19 @@ class Broker:
 broker = Broker()
 
 
-async def _delete_msg(msg_id: str) -> None:
+async def _delete_msg(msg_id: str, to_user: str) -> None:
+    """R2: scoped delete — only the owning recipient's ack removes the row."""
     async with SessionLocal() as db:
         row = await db.get(models.OfflineQueue, msg_id)
-        if row is not None:
+        if row is not None and row.to_user == to_user:
             await db.delete(row)
             await db.commit()
 
 
 async def flush_queue(username: str) -> None:
-    """Push queued rows on connect; DELETE after successful send (ack best-effort)."""
+    """R3: push only — never delete on send. Rows die exclusively via the
+    ack path, so a client that connects then drops loses nothing; the next
+    connect redelivers (at-least-once, client dedups by msg_id)."""
     async with SessionLocal() as db:
         res = await db.execute(
             select(models.OfflineQueue)
@@ -94,11 +104,9 @@ async def flush_queue(username: str) -> None:
         )
         rows = list(res.scalars().all())
     for r in rows:
-        sent = await broker.push(
+        await broker.push(
             username, {"from": r.from_user, "envelope_b64": r.envelope_b64, "msg_id": r.msg_id}
         )
-        if sent:
-            await _delete_msg(r.msg_id)
 
 
 async def auth_token(token_b64: str) -> str | None:
@@ -116,7 +124,13 @@ async def auth_token(token_b64: str) -> str | None:
 
 @router.websocket("/api/v1/ws")
 async def ws_endpoint(ws: WebSocket):
-    token = ws.query_params.get("token", "")
+    # R1: header-only. Tokens in URLs leak into proxy/uvicorn logs;
+    # native app has no browser constraint justifying ?token=.
+    auth = ws.headers.get("authorization", "")
+    scheme, _, token = auth.partition(" ")
+    if scheme.lower() != "bearer" or not token:
+        await ws.close(code=4401)
+        return
     username = await auth_token(token)
     if username is None:
         await ws.close(code=4401)
@@ -134,10 +148,10 @@ async def ws_endpoint(ws: WebSocket):
                 msg = json.loads(raw)
             except Exception:
                 continue
-            # Ack path: {type: ack, msg_id} -> instant hard DELETE.
+            # Ack path: {type: ack, msg_id} -> instant hard DELETE (scoped).
             if msg.get("type") == "ack" and msg.get("msg_id"):
-                broker.resolve_ack(msg["msg_id"])
-                await _delete_msg(msg["msg_id"])
+                broker.resolve_ack(username, msg["msg_id"])
+                await _delete_msg(msg["msg_id"], username)
                 continue
             # Read receipts routed, never stored.
             if msg.get("type") == "read" and msg.get("msg_id"):
@@ -170,13 +184,13 @@ async def ws_endpoint(ws: WebSocket):
                     to_user, {"from": username, "envelope_b64": env, "msg_id": msg_id}
                 )
                 if sent:
-                    ev = broker.expect_ack(msg_id)
+                    ev = broker.expect_ack(to_user, msg_id)
                     try:
                         await asyncio.wait_for(ev.wait(), timeout=ACK_TIMEOUT_SEC)
                     except asyncio.TimeoutError:
                         pass  # row stays queued for redelivery on reconnect
                     else:
-                        await _delete_msg(msg_id)
+                        await _delete_msg(msg_id, to_user)
     except WebSocketDisconnect:
         pass
     finally:

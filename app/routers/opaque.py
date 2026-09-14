@@ -189,17 +189,28 @@ async def login_finish(
             },
         )
     except sidecar.SidecarAuthError:
+        # m1: single-use state must die even on failure — commit the delete
+        # here so a failed finalization cannot be replayed.
+        await db.delete(ls)
+        await db.commit()
         raise HTTPException(401, "login failed")
     except sidecar.SidecarInfraError:
-        raise HTTPException(500, "auth backend unavailable")
-    finally:
-        # Single-use state regardless of outcome.
         await db.delete(ls)
+        await db.commit()
+        raise HTTPException(500, "auth backend unavailable")
+    # Success: consume the state before minting the token.
+    await db.delete(ls)
     # B1 verbatim derivation; B4: session_key never leaves this scope.
-    session_key = base64.b64decode(ok["session_key"])
-    token = tokens.derive_ws_token(session_key, body.username)
-    session_key = b"\x00" * len(session_key)
-    del session_key
+    # m2: bytearray so we can zero the buffer in place — rebinding an
+    # immutable `bytes` object (b"\x00" * len) would NOT wipe the original.
+    # Best-effort on CPython (no mlock/memset guarantee); scope exit drops it.
+    sk_buf = bytearray(base64.b64decode(ok["session_key"]))
+    try:
+        token = tokens.derive_ws_token(bytes(sk_buf), body.username)
+    finally:
+        for i in range(len(sk_buf)):
+            sk_buf[i] = 0
+        del sk_buf
     now = int(time.time())
     exp = now + min(config.WS_TOKEN_MAX_AGE_SEC, 30 * 24 * 3600)  # 30-day cap
     db.add(

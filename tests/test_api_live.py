@@ -111,12 +111,10 @@ def test_full_register_login_roundtrip(client):
     assert body["ws_token_b64"]
     # Export-key continuity registration -> login.
     assert c1["export_key"] == l1["export_key"]
-    # WS token authenticates the relay socket (connect + instant close is enough).
-    # NOTE: b64 tokens contain +/= so the query value must be URL-encoded.
-    import urllib.parse
-
-    tok = urllib.parse.quote(body["ws_token_b64"], safe="")
-    with client.websocket_connect(f"/api/v1/ws?token={tok}"):
+    # WS token authenticates the relay socket via Bearer header (R1: no ?token=).
+    with client.websocket_connect(
+        "/api/v1/ws", headers={"authorization": f"Bearer {body['ws_token_b64']}"}
+    ):
         pass
 
 
