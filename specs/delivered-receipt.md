@@ -32,3 +32,29 @@ Ticks are live-only: a sender offline at delivery/read time misses that tick
 (the row is gone, nothing to reconcile on reconnect). Tick-state sync on
 reconnect is deferred work, tracked separately — it needs a per-thread
 high-water-mark endpoint that does not exist yet.
+
+---
+
+# Rekey nudge (REQUIRED alongside the above)
+
+## Problem
+When a device re-publishes keys (new login without local keys), peers that
+fetched the OLD bundle keep encrypting to it. The re-published device cannot
+decrypt those envelopes (old secrets are gone), and — critically — the sender
+cannot detect this: encryption succeeds, transport succeeds, only the
+recipient's silent decrypt fails. Both sides stall forever.
+
+## Change (relay.py, same pattern as read receipts)
+Route `{type:"rekey", to:<peer>}` exactly like `{type:"read"}`: no storage,
+no ack, push-if-online to `to`, drop otherwise. Three lines next to the read
+branch. No schema change.
+
+## Client behavior (already implemented app-side)
+- On sender side nothing changes.
+- Recipient, on Bob-handshake failure against current secrets, sends
+  `{type:"rekey", to:<original sender>}` and keeps the ciphertext.
+- Sender, on inbound `rekey` from peer P, shreds its session for P; its next
+  send handshakes fresh from the current directory bundle. Healing is automatic
+  within one message round-trip, no user action.
+- `rekey` for unknown peers is ignored. Rate-limit naturally by socket fairness
+  (a malicious peer can only make you re-handshake; each costs them a message).

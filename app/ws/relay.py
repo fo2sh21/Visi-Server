@@ -11,8 +11,12 @@ reconnect. Client contract: dedup by msg_id; on an already-seen msg_id,
 re-send the ack but do NOT reprocess the envelope (else redeliveries loop).
 Acks are idempotent. Only an ack from the owning recipient deletes a row.
 Ticks: the ack triggers a best-effort {"type": "delivered"} push to the
-original sender (live-only — an offline sender misses the tick; tick-state
-sync on reconnect is deferred work requiring a high-water-mark endpoint).
+original sender when online; when offline, a durable pending-delivered row
+is stored instead and flushed on reconnect (same lifecycle as messages:
+stored only until acknowledged, never archived). Read receipts to offline
+targets are likewise stored. Rekey nudges stay live-only, never stored.
+Tick-state sync on reconnect is therefore complete for senders back within
+30 days (older pending receipts are lazily swept on flush).
 """
 from __future__ import annotations
 
@@ -23,7 +27,8 @@ import time
 import uuid
 
 from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
-from sqlalchemy import select
+from sqlalchemy import delete, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import models, tokens
@@ -32,6 +37,7 @@ from ..db import SessionLocal, get_db
 router = APIRouter(tags=["ws"])
 
 ACK_TIMEOUT_SEC = 30
+RECEIPT_TTL_SEC = 30 * 24 * 3600
 
 
 class Broker:
@@ -129,7 +135,11 @@ async def _pop_sender(msg_id: str, to_user: str) -> str | None:
 async def flush_queue(username: str) -> None:
     """R3: push only — never delete on send. Rows die exclusively via the
     ack path, so a client that connects then drops loses nothing; the next
-    connect redelivers (at-least-once, client dedups by msg_id)."""
+    connect redelivers (at-least-once, client dedups by msg_id).
+
+    Durable receipts ride the same flush: lazy 30-day sweep for this user,
+    then pending receipts oldest-first as {type, msg_id, receipt_id}.
+    Receipt rows die only on {type:ack, receipt_id} from the addressee."""
     async with SessionLocal() as db:
         res = await db.execute(
             select(models.OfflineQueue)
@@ -142,6 +152,41 @@ async def flush_queue(username: str) -> None:
         await broker.push(
             username, {"from": r.from_user, "envelope_b64": r.envelope_b64, "msg_id": r.msg_id}
         )
+    cutoff = int(time.time()) - RECEIPT_TTL_SEC
+    async with SessionLocal() as db:
+        await db.execute(
+            delete(models.PendingReceipt).where(
+                models.PendingReceipt.to_user == username,
+                models.PendingReceipt.created_at < cutoff,
+            )
+        )
+        await db.commit()
+        res = await db.execute(
+            select(models.PendingReceipt)
+            .where(models.PendingReceipt.to_user == username)
+            .order_by(models.PendingReceipt.created_at)
+            .limit(100)
+        )
+        receipts = list(res.scalars().all())
+    for p in receipts:
+        await broker.push(
+            username, {"type": p.kind, "msg_id": p.msg_id, "receipt_id": p.id}
+        )
+
+
+async def _store_receipt(to_user: str, kind: str, msg_id: str) -> None:
+    """Durable backstop: persist a receipt until the addressee acks it.
+
+    Same lifecycle as messages (stored only until acknowledged, never
+    archived). Dedup-guarded by UNIQUE(to_user, kind, msg_id) — duplicate
+    acks/reads collapse into one row (IntegrityError -> ignore). Never logged.
+    """
+    async with SessionLocal() as db:
+        db.add(models.PendingReceipt(to_user=to_user, kind=kind, msg_id=msg_id))
+        try:
+            await db.commit()
+        except IntegrityError:
+            await db.rollback()
 
 
 async def auth_token(token_b64: str) -> str | None:
@@ -183,32 +228,71 @@ async def ws_endpoint(ws: WebSocket):
                 msg = json.loads(raw)
             except Exception:
                 continue
-            # Ack path: {type: ack, msg_id} -> delivered tick + hard DELETE.
-            # Tick goes out BEFORE the row is gone (sender read from the row
-            # itself); best-effort, never persisted. Duplicate acks re-push
-            # the identical payload — client dedups by msg_id.
+            # Receipt acks: {type: ack, receipt_id} -> scoped DELETE only.
+            # Receipts never generate receipts (no loops); duplicate acks
+            # find no row and stay silent.
+            if msg.get("type") == "ack" and msg.get("receipt_id"):
+                async with SessionLocal() as db:
+                    row = await db.get(models.PendingReceipt, msg["receipt_id"])
+                    if row is not None and row.to_user == username:
+                        await db.delete(row)
+                        await db.commit()
+                continue
+            # Message acks: {type: ack, msg_id} -> live tick if the sender is
+            # online, durable pending-delivered row if offline. Duplicate acks
+            # re-push the identical tick (client dedups by msg_id).
             if msg.get("type") == "ack" and msg.get("msg_id"):
                 broker.resolve_ack(username, msg["msg_id"])
                 sender = await _pop_sender(msg["msg_id"], username)
                 if sender is None:
                     # Duplicate ack for an already-deleted row: same tick
-                    # again (client dedups by msg_id). Unknown msg_id or
-                    # another user's row stays silent.
+                    # again. Unknown msg_id or another user's row stays silent
+                    # — unless this is a live-tick ack (plain msg_id): consume
+                    # a pending row on exact (to_user, msg_id, delivered) match
+                    # only, so it can never eat a pending read.
                     sender = broker.acked_sender(username, msg["msg_id"])
-                if sender and sender != username and broker.is_online(sender):
-                    await broker.push(
-                        sender,
-                        {"type": "delivered", "msg_id": msg["msg_id"], "to": sender},
-                    )
+                    if sender is None:
+                        async with SessionLocal() as db:
+                            res = await db.execute(
+                                select(models.PendingReceipt).where(
+                                    models.PendingReceipt.to_user == username,
+                                    models.PendingReceipt.kind == "delivered",
+                                    models.PendingReceipt.msg_id == msg["msg_id"],
+                                )
+                            )
+                            prow = res.scalars().first()
+                            if prow is not None:
+                                await db.delete(prow)
+                                await db.commit()
+                        continue
+                if sender != username:
+                    if broker.is_online(sender):
+                        await broker.push(
+                            sender,
+                            {"type": "delivered", "msg_id": msg["msg_id"], "to": sender},
+                        )
+                    else:
+                        await _store_receipt(sender, "delivered", msg["msg_id"])
                 continue
-            # Read receipts routed, never stored.
+            # Read receipts: live route if online, durable backstop if offline.
             if msg.get("type") == "read" and msg.get("msg_id"):
                 target = msg.get("to", "")
                 if target:
-                    await broker.push(
-                        target,
-                        {"type": "read", "from": username, "msg_id": msg["msg_id"]},
-                    )
+                    if broker.is_online(target):
+                        await broker.push(
+                            target,
+                            {"type": "read", "from": username, "msg_id": msg["msg_id"]},
+                        )
+                    else:
+                        await _store_receipt(target, "read", msg["msg_id"])
+                continue
+            # Rekey nudge: live-only, never stored — push-if-online, drop
+            # otherwise. A missed nudge self-heals: the sender's next send to
+            # the stale bundle fails again and draws a fresh nudge.
+            if msg.get("type") == "rekey" and msg.get("to"):
+                await broker.push(
+                    msg["to"], {"type": "rekey", "from": username, "to": msg["to"]}
+                )
                 continue
             to_user, env, msg_id = msg.get("to"), msg.get("envelope_b64"), msg.get(
                 "msg_id", uuid.uuid4().hex

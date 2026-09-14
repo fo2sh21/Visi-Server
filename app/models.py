@@ -4,7 +4,7 @@ from __future__ import annotations
 import time
 import uuid
 
-from sqlalchemy import BigInteger, LargeBinary, String, Text
+from sqlalchemy import BigInteger, LargeBinary, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -83,6 +83,24 @@ class WsToken(Base):
     username: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     issued_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
     expires_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+
+class PendingReceipt(Base):
+    """Durable receipts: same lifecycle as messages — stored only until the
+    addressee acks, never archived. kind ∈ {delivered, read}. The UNIQUE
+    guard makes generation idempotent under duplicate acks/reads."""
+
+    __tablename__ = "pending_receipts"
+    __table_args__ = (UniqueConstraint("to_user", "kind", "msg_id"),)
+    id: Mapped[str] = mapped_column(
+        String(64), primary_key=True, default=lambda: uuid.uuid4().hex
+    )
+    to_user: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    msg_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=lambda: int(time.time())
+    )
 
 
 class MerkleLeaf(Base):
