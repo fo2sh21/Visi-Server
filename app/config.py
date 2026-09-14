@@ -28,6 +28,14 @@ UPDATE_DOWNLOAD_URL = os.getenv(
     "UPDATE_DOWNLOAD_URL", "https://your-domain.com/releases/visiapp-1.0.4.apk"
 )
 UPDATE_SHA256 = os.getenv("UPDATE_SHA256", "")
+# OTA bucket source of truth (specs/ota-latest-json.md). Empty = local-dev
+# fallback to the env-var manifest above, no bucket fetch attempted.
+UPDATE_BUCKET_BASE = os.getenv("UPDATE_BUCKET_BASE", "").rstrip("/")
+UPDATE_MANIFEST_TTL_SEC = int(os.getenv("UPDATE_MANIFEST_TTL_SEC", "300"))
+
+# FCM push (specs/fcm-push.md). Service-account JSON path, server-side only.
+# Absent = push silently disabled (logged once at startup, not per message).
+FCM_CREDENTIALS_PATH = os.getenv("FCM_CREDENTIALS_PATH", "")
 
 # Rate limits (M3: buckets keyed by in-memory hash only).
 LOGIN_RATE_LIMIT = os.getenv("LOGIN_RATE_LIMIT", "10/minute")

@@ -8,7 +8,7 @@ from fastapi import FastAPI
 
 from . import models, security
 from .db import engine
-from .routers import directory, opaque, presence, update
+from .routers import directory, opaque, presence, push, update
 from .ws import relay
 
 
@@ -45,6 +45,7 @@ def create_app() -> FastAPI:
     app.include_router(directory.router)
     app.include_router(update.router)
     app.include_router(presence.router)
+    app.include_router(push.router)
     app.include_router(relay.router)
 
     @app.get("/healthz")

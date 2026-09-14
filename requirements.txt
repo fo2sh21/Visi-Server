@@ -5,6 +5,7 @@ aiosqlite
 asyncpg
 pydantic
 cryptography
+google-auth
 httpx
 pytest
 pytest-asyncio

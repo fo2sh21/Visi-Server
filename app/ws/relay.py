@@ -33,6 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import models, tokens
 from ..db import SessionLocal, get_db
+from ..fcm import send_ping as _fcm_ping
 
 router = APIRouter(tags=["ws"])
 
@@ -189,6 +190,26 @@ async def _store_receipt(to_user: str, kind: str, msg_id: str) -> None:
             await db.rollback()
 
 
+async def _maybe_ping(to_user: str) -> None:
+    """FCM doorbell: data-only ping to an offline recipient's stored token.
+
+    Fire-and-forget from the send path — never blocks the relay. Stale
+    (unregistered) tokens are deleted; anything else fails silent. The
+    offline queue remains the source of truth; the token is never logged.
+    """
+    async with SessionLocal() as db:
+        row = await db.get(models.PushToken, to_user)
+        token = row.fcm_token if row else None
+    if not token:
+        return
+    if await _fcm_ping(token) == "stale":
+        async with SessionLocal() as db:
+            row = await db.get(models.PushToken, to_user)
+            if row is not None and row.fcm_token == token:
+                await db.delete(row)
+                await db.commit()
+
+
 async def auth_token(token_b64: str) -> str | None:
     try:
         raw = base64.b64decode(token_b64, validate=True)
@@ -315,6 +336,12 @@ async def ws_endpoint(ws: WebSocket):
                     )
                 )
                 await db.commit()
+            # FCM doorbell for offline recipients (fire-and-forget task: a
+            # slow FCM must never stall the relay). Online recipients drain
+            # via the socket below; a redundant ping on a connect race is
+            # harmless (doorbell only — the client drains the queue itself).
+            if not broker.is_online(to_user):
+                asyncio.create_task(_maybe_ping(to_user))
             if broker.is_online(to_user):
                 sent = await broker.push(
                     to_user, {"from": username, "envelope_b64": env, "msg_id": msg_id}

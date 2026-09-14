@@ -87,3 +87,12 @@ class UpdateOut(BaseModel):
     version_code: int
     download_url: str
     sha256: str
+
+
+class PushTokenIn(BaseModel):
+    username: str = Field(pattern=r"^[a-zA-Z0-9_.\-]{3,32}$")
+    fcm_token: str = Field(min_length=1, max_length=4096)
+
+
+class PushTokenDeleteIn(BaseModel):
+    username: str = Field(pattern=r"^[a-zA-Z0-9_.\-]{3,32}$")

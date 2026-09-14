@@ -124,3 +124,22 @@ class MerkleState(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     size: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     root: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
+
+
+class OtaState(Base):
+    """Anti-downgrade guard: highest manifest version ever served."""
+
+    __tablename__ = "ota_state"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    max_seen_version: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+
+
+class PushToken(Base):
+    """FCM routing metadata (like usernames: stored plainly, never logged)."""
+
+    __tablename__ = "push_tokens"
+    username: Mapped[str] = mapped_column(String(32), primary_key=True)
+    fcm_token: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=lambda: int(time.time())
+    )
