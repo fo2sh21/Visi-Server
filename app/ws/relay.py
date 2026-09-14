@@ -10,6 +10,9 @@ Delivery is at-least-once: unacked rows stay queued and are redelivered on
 reconnect. Client contract: dedup by msg_id; on an already-seen msg_id,
 re-send the ack but do NOT reprocess the envelope (else redeliveries loop).
 Acks are idempotent. Only an ack from the owning recipient deletes a row.
+Ticks: the ack triggers a best-effort {"type": "delivered"} push to the
+original sender (live-only — an offline sender misses the tick; tick-state
+sync on reconnect is deferred work requiring a high-water-mark endpoint).
 """
 from __future__ import annotations
 
@@ -38,6 +41,11 @@ class Broker:
         self.online: dict[str, set[WebSocket]] = {}
         # m3: keyed by (username, msg_id) — bare msg_id collides across users.
         self.acks: dict[tuple[str, str], asyncio.Event] = {}
+        # Delivered-tick memory: (recipient, msg_id) -> original sender for
+        # rows already hard-deleted, so a duplicate ack re-pushes the
+        # identical tick instead of going silent. Bounded FIFO; single-
+        # instance v1 like `acks` (a Redis Broker impl would carry this too).
+        self.recently_acked: dict[tuple[str, str], str] = {}
         self.lock = asyncio.Lock()
 
     async def connect(self, username: str, ws: WebSocket) -> None:
@@ -78,6 +86,14 @@ class Broker:
         if ev is not None:
             ev.set()
 
+    def remember_acked(self, username: str, msg_id: str, sender: str) -> None:
+        self.recently_acked[(username, msg_id)] = sender
+        while len(self.recently_acked) > 1024:
+            self.recently_acked.pop(next(iter(self.recently_acked)))
+
+    def acked_sender(self, username: str, msg_id: str) -> str | None:
+        return self.recently_acked.get((username, msg_id))
+
 
 broker = Broker()
 
@@ -89,6 +105,25 @@ async def _delete_msg(msg_id: str, to_user: str) -> None:
         if row is not None and row.to_user == to_user:
             await db.delete(row)
             await db.commit()
+
+
+async def _pop_sender(msg_id: str, to_user: str) -> str | None:
+    """Delivered-receipt helper: load the original sender, then hard-DELETE.
+
+    Single scoped SELECT (same msg_id + to_user predicate as R2), so the
+    sender lookup and the delete share one ownership check and one round-trip.
+    Returns the sender username, or None if no such row (unknown msg_id or
+    another user's ack — both are silent no-ops for the tick).
+    """
+    async with SessionLocal() as db:
+        row = await db.get(models.OfflineQueue, msg_id)
+        if row is None or row.to_user != to_user:
+            return None
+        sender = row.from_user
+        await db.delete(row)
+        await db.commit()
+        broker.remember_acked(to_user, msg_id, sender)
+        return sender
 
 
 async def flush_queue(username: str) -> None:
@@ -148,10 +183,23 @@ async def ws_endpoint(ws: WebSocket):
                 msg = json.loads(raw)
             except Exception:
                 continue
-            # Ack path: {type: ack, msg_id} -> instant hard DELETE (scoped).
+            # Ack path: {type: ack, msg_id} -> delivered tick + hard DELETE.
+            # Tick goes out BEFORE the row is gone (sender read from the row
+            # itself); best-effort, never persisted. Duplicate acks re-push
+            # the identical payload — client dedups by msg_id.
             if msg.get("type") == "ack" and msg.get("msg_id"):
                 broker.resolve_ack(username, msg["msg_id"])
-                await _delete_msg(msg["msg_id"], username)
+                sender = await _pop_sender(msg["msg_id"], username)
+                if sender is None:
+                    # Duplicate ack for an already-deleted row: same tick
+                    # again (client dedups by msg_id). Unknown msg_id or
+                    # another user's row stays silent.
+                    sender = broker.acked_sender(username, msg["msg_id"])
+                if sender and sender != username and broker.is_online(sender):
+                    await broker.push(
+                        sender,
+                        {"type": "delivered", "msg_id": msg["msg_id"], "to": sender},
+                    )
                 continue
             # Read receipts routed, never stored.
             if msg.get("type") == "read" and msg.get("msg_id"):

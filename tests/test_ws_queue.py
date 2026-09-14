@@ -140,3 +140,68 @@ def test_query_token_rejected(tmp_path, monkeypatch):
     except Exception:
         rejected = True
     assert rejected
+
+
+def test_delivered_tick_happy_path(tmp_path, monkeypatch):
+    """Ack triggers {"type":"delivered"} to the online original sender."""
+    import json
+
+    gen = _mkclient(tmp_path, monkeypatch)
+    client, dbmod, models = next(gen)
+    raw_a, th_a = _tok(b"A" * 32)
+    raw_b, th_b = _tok(b"B" * 32)
+    _seed(dbmod, models, [("alice", th_a), ("bob", th_b)],
+          [{"msg_id": "m10", "to_user": "bob", "from_user": "alice",
+            "envelope_b64": base64.b64encode(b"ct").decode()}])
+    hdr_a = {"authorization": f"Bearer {raw_a}"}
+    hdr_b = {"authorization": f"Bearer {raw_b}"}
+    with client.websocket_connect("/api/v1/ws", headers=hdr_a) as alice:
+        with client.websocket_connect("/api/v1/ws", headers=hdr_b) as bob:
+            assert '"m10"' in bob.receive_text()  # flush
+            bob.send_text('{"type": "ack", "msg_id": "m10"}')
+            tick = json.loads(alice.receive_text())
+            assert tick == {"type": "delivered", "msg_id": "m10", "to": "alice"}
+    assert _get(dbmod, models, "m10") is None  # row hard-deleted
+
+
+def test_delivered_missed_when_sender_offline(tmp_path, monkeypatch):
+    """Sender offline at delivery: row still deleted, no tick, no error."""
+    gen = _mkclient(tmp_path, monkeypatch)
+    client, dbmod, models = next(gen)
+    raw_b, th_b = _tok(b"B" * 32)
+    _, th_a = _tok(b"A" * 32)
+    _seed(dbmod, models, [("alice", th_a), ("bob", th_b)],
+          [{"msg_id": "m11", "to_user": "bob", "from_user": "alice",
+            "envelope_b64": base64.b64encode(b"ct").decode()}])
+    with client.websocket_connect(
+        "/api/v1/ws", headers={"authorization": f"Bearer {raw_b}"}
+    ) as bob:
+        assert '"m11"' in bob.receive_text()
+        bob.send_text('{"type": "ack", "msg_id": "m11"}')
+        time.sleep(0.5)
+    assert _get(dbmod, models, "m11") is None
+
+
+def test_duplicate_ack_repushes_identical_tick(tmp_path, monkeypatch):
+    """Duplicate acks re-push the same payload; row stays gone (idempotent)."""
+    import json
+
+    gen = _mkclient(tmp_path, monkeypatch)
+    client, dbmod, models = next(gen)
+    raw_a, th_a = _tok(b"A" * 32)
+    raw_b, th_b = _tok(b"B" * 32)
+    _seed(dbmod, models, [("alice", th_a), ("bob", th_b)],
+          [{"msg_id": "m12", "to_user": "bob", "from_user": "alice",
+            "envelope_b64": base64.b64encode(b"ct").decode()}])
+    hdr_a = {"authorization": f"Bearer {raw_a}"}
+    hdr_b = {"authorization": f"Bearer {raw_b}"}
+    with client.websocket_connect("/api/v1/ws", headers=hdr_a) as alice:
+        with client.websocket_connect("/api/v1/ws", headers=hdr_b) as bob:
+            assert '"m12"' in bob.receive_text()
+            bob.send_text('{"type": "ack", "msg_id": "m12"}')
+            assert json.loads(alice.receive_text()) == {
+                "type": "delivered", "msg_id": "m12", "to": "alice"}
+            bob.send_text('{"type": "ack", "msg_id": "m12"}')  # dup
+            assert json.loads(alice.receive_text()) == {
+                "type": "delivered", "msg_id": "m12", "to": "alice"}
+    assert _get(dbmod, models, "m12") is None
