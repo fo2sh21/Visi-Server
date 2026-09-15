@@ -360,6 +360,28 @@ async def ws_endpoint(ws: WebSocket):
                     msg["to"], {"type": "rekey", "from": username, "to": msg["to"]}
                 )
                 continue
+            # Decrypt-failed NACK: the receiver stored our message but no
+            # session generation opens it. Live-route if the sender is online;
+            # otherwise a DURABLE receipt so the sender heals on next connect
+            # (deduped by UNIQUE(to_user, kind, msg_id) like read receipts).
+            # Flushed without "from" — the sender resolves the thread from
+            # their own row by msg_id. Sender-stamped here, never trusted
+            # from the wire.
+            if msg.get("type") == "decrypt-failed" and msg.get("msg_id"):
+                target = msg.get("to", "")
+                if target:
+                    if broker.is_online(target):
+                        await broker.push(
+                            target,
+                            {
+                                "type": "decrypt-failed",
+                                "from": username,
+                                "msg_id": msg["msg_id"],
+                            },
+                        )
+                    else:
+                        await _store_receipt(target, "decrypt-failed", msg["msg_id"])
+                continue
             # Typing flicker: live-only, never stored — push-if-online, drop
             # otherwise. A lost frame is a missed flicker, never stuck state
             # (client clears on an 8s failsafe). Old clients without the typing

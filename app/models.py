@@ -96,8 +96,10 @@ class WsToken(Base):
 
 class PendingReceipt(Base):
     """Durable receipts: same lifecycle as messages — stored only until the
-    addressee acks, never archived. kind ∈ {delivered, read}. The UNIQUE
-    guard makes generation idempotent under duplicate acks/reads."""
+    addressee acks, never archived. kind ∈ {delivered, read, decrypt-failed}.
+    The UNIQUE guard makes generation idempotent under duplicate acks/reads.
+    decrypt-failed carries no sender: the sender resolves the thread from
+    their own row by msg_id."""
 
     __tablename__ = "pending_receipts"
     __table_args__ = (UniqueConstraint("to_user", "kind", "msg_id"),)
