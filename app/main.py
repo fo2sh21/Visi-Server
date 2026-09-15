@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from . import models, security
+from . import config, models, security
 from .db import engine
 from .routers import directory, opaque, presence, push, update
 from .ws import relay
@@ -40,6 +40,13 @@ async def lifespan(app: FastAPI):
 def create_app() -> FastAPI:
     security.install_no_ip_logging()
     logging.getLogger("uvicorn.access").disabled = True
+    if config.DATABASE_URL.startswith("sqlite"):
+        # Deploy guardrail (specs/render-deploy.md §3): a file DB evaporates
+        # on the first restart. Prod must set DATABASE_URL to hosted Postgres.
+        logging.getLogger("uvicorn.error").error(
+            "DATABASE_URL is SQLite — ephemeral on hosted free tiers; "
+            "set hosted Postgres or all data is lost on restart"
+        )
     app = FastAPI(title="Visi Relay", version="1.0.0", lifespan=lifespan)
     app.include_router(opaque.router)
     app.include_router(directory.router)
@@ -50,6 +57,12 @@ def create_app() -> FastAPI:
 
     @app.get("/healthz")
     async def healthz():
+        return {"status": "ok"}
+
+    @app.get("/health")
+    async def health():
+        # Keeper alias (specs/render-deploy.md §4): external cron pings this
+        # every 10 min so the free instance doesn't sleep. Same shape as /healthz.
         return {"status": "ok"}
 
     return app

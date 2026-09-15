@@ -5,9 +5,14 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from . import config
 
-connect_args = {}
+connect_args: dict = {}
 if config.DATABASE_URL.startswith("sqlite"):
     connect_args = {"check_same_thread": False}
+else:
+    # Neon pooled URL sits behind pgbouncer: prepared statements die on
+    # pgbouncer, so asyncpg must not use its statement cache (deploy blocker
+    # per specs/render-deploy.md §2).
+    connect_args = {"statement_cache_size": 0}
 
 engine = create_async_engine(
     config.DATABASE_URL,

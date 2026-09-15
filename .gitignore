@@ -19,3 +19,10 @@ venv/
 .env
 *.pem
 *.key
+
+# Firebase / service credentials (never commit)
+google-services.json
+*-service-account*.json
+service-account*.json
+credentials*.json
+FCM_CREDENTIALS_JSON.json

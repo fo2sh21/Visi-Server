@@ -33,8 +33,10 @@ UPDATE_SHA256 = os.getenv("UPDATE_SHA256", "")
 UPDATE_BUCKET_BASE = os.getenv("UPDATE_BUCKET_BASE", "").rstrip("/")
 UPDATE_MANIFEST_TTL_SEC = int(os.getenv("UPDATE_MANIFEST_TTL_SEC", "300"))
 
-# FCM push (specs/fcm-push.md). Service-account JSON path, server-side only.
-# Absent = push silently disabled (logged once at startup, not per message).
+# FCM push (specs/fcm-push.md). Inline service-account JSON first (Render/prod,
+# wipe-safe: whole file content as one env value), file path as local fallback.
+# Absent both = push silently disabled (logged once at startup, not per msg).
+FCM_CREDENTIALS_JSON = os.getenv("FCM_CREDENTIALS_JSON", "")
 FCM_CREDENTIALS_PATH = os.getenv("FCM_CREDENTIALS_PATH", "")
 
 # Rate limits (M3: buckets keyed by in-memory hash only).

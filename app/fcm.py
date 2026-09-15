@@ -28,22 +28,35 @@ _disabled_logged = False
 
 
 def _load() -> tuple | None:
-    """Load service-account creds once. None = push disabled (no creds)."""
+    """Load service-account creds once. None = push disabled (no creds).
+
+    Precedence: inline `FCM_CREDENTIALS_JSON` env (whole JSON as one value —
+    the Render/prod path, wipe-safe) first, `FCM_CREDENTIALS_PATH` file as
+    local-dev fallback.
+    """
     global _disabled_logged
     if _creds["loaded"]:
         return (_creds["creds"], _creds["project_id"]) if _creds["creds"] else None
     _creds["loaded"] = True
-    path = config.FCM_CREDENTIALS_PATH
-    if not path:
-        return None
     try:
         from google.oauth2 import service_account
 
-        creds = service_account.Credentials.from_service_account_file(
-            path, scopes=[_FCM_SCOPE]
-        )
-        with open(path, encoding="utf-8") as f:
-            project_id = json.load(f).get("project_id", "")
+        info = config.FCM_CREDENTIALS_JSON
+        if info:
+            doc = json.loads(info)
+            creds = service_account.Credentials.from_service_account_info(
+                doc, scopes=[_FCM_SCOPE]
+            )
+            project_id = doc.get("project_id", "")
+        else:
+            path = config.FCM_CREDENTIALS_PATH
+            if not path:
+                return None
+            creds = service_account.Credentials.from_service_account_file(
+                path, scopes=[_FCM_SCOPE]
+            )
+            with open(path, encoding="utf-8") as f:
+                project_id = json.load(f).get("project_id", "")
         if not project_id:
             return None
         _creds.update(creds=creds, project_id=project_id)
