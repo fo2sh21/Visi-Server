@@ -77,7 +77,11 @@ async def _access_token(creds) -> str | None:
             creds.refresh, google.auth.transport.requests.Request()
         )
         return creds.token
-    except Exception:
+    except Exception as e:
+        # A deleted/disabled service account dies here (invalid_grant);
+        # malformed key material dies here too. Class + short message only —
+        # no token, no user, no key material.
+        log.warning("FCM oauth failed: %s: %.100s", type(e).__name__, e)
         return None
 
 
@@ -111,7 +115,9 @@ async def send_ping(fcm_token: str) -> str:
                     }
                 },
             )
-    except Exception:
+    except Exception as e:
+        # Transport fault (DNS/TLS/timeout/egress) — class + message only.
+        log.warning("FCM post failed: %s: %.100s", type(e).__name__, e)
         return "error"
     if r.status_code == 200:
         return "ok"
@@ -120,7 +126,9 @@ async def send_ping(fcm_token: str) -> str:
         status = err.get("status", "")
         details = str(err.get("details", ""))
     except Exception:
-        status, details = "", ""
+        # Non-JSON error body (proxy/HTML page): status code only, the body
+        # itself is never logged.
+        log.warning("FCM ping error: http=%s non-json error body", r.status_code)
         return "error"
     if status in ("NOT_FOUND", "INVALID_ARGUMENT") and (
         "UNREGISTERED" in details or status == "NOT_FOUND"

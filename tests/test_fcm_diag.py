@@ -128,6 +128,49 @@ def test_500_maps_to_error_with_status(monkeypatch, caplog):
 def test_transport_exception_is_error(monkeypatch, caplog):
     _patch(monkeypatch, explode=True)
     assert asyncio.run(fcm_mod.send_ping("t")) == "error"
+    assert "FCM post failed" in caplog.text
+    assert "OSError" in caplog.text
+
+
+def test_oauth_failure_logged(monkeypatch, caplog):
+    class DeadCreds:
+        def refresh(self, request):
+            raise ValueError("invalid_grant: account not found")
+
+    assert asyncio.run(fcm_mod._access_token(DeadCreds())) is None
+    assert "FCM oauth failed" in caplog.text
+    assert "invalid_grant" in caplog.text
+
+
+def test_non_json_body_logs_status(monkeypatch, caplog):
+    sent = {}
+
+    class HtmlResp(_Resp):
+        def json(self):
+            raise ValueError("No JSON object could be decoded")
+
+    class Client:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, headers=None, json=None):
+            sent["url"] = url
+            return HtmlResp(502)
+
+    import httpx as _httpx
+
+    monkeypatch.setattr(fcm_mod, "_load", lambda: (_Creds(), "proj"))
+    monkeypatch.setattr(fcm_mod, "_access_token", lambda c: asyncio.sleep(0, result="AT"))
+    monkeypatch.setattr(_httpx, "AsyncClient", Client)
+    assert asyncio.run(fcm_mod.send_ping("t")) == "error"
+    assert "http=502" in caplog.text
+    assert "non-json" in caplog.text
 
 
 def test_no_creds_no_network(monkeypatch):
