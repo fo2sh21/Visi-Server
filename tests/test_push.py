@@ -226,7 +226,8 @@ def test_fcm_payload_shape_and_outcomes(tmp_path, monkeypatch):
 
     Client.next_resp = (200, {})
     assert asyncio.run(fcm.send_ping("t")) == "ok"
-    assert sent["json"] == {"message": {"token": "t", "data": {"ping": "true"}}}
+    assert sent["json"] == {"message": {"token": "t", "data": {"ping": "true"},
+                                        "android": {"priority": "HIGH"}}}
     assert "notification" not in sent["json"]["message"]
     assert sent["headers"] == {"Authorization": "Bearer AT"}
     assert sent["url"].endswith("/v1/projects/proj/messages:send")

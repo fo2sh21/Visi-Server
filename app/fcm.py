@@ -120,9 +120,16 @@ async def send_ping(fcm_token: str) -> str:
         status = err.get("status", "")
         details = str(err.get("details", ""))
     except Exception:
+        status, details = "", ""
         return "error"
     if status in ("NOT_FOUND", "INVALID_ARGUMENT") and (
         "UNREGISTERED" in details or status == "NOT_FOUND"
     ):
         return "stale"
+    # Name the rejection (HTTP + FCM status only — no token, no user, no
+    # identifiers). Bare "error" cost a full debug cycle when every ping
+    # died the same silent way; the status distinguishes API-disabled (403
+    # PERMISSION_DENIED, enable the FCM API) from IAM (403, grant the sender
+    # role) from transport failures.
+    log.warning("FCM ping error: http=%s status=%s", r.status_code, status or "?")
     return "error"

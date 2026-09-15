@@ -239,7 +239,9 @@ async def _maybe_ping(to_user: str) -> None:
         return
     outcome = await _fcm_ping(token)
     if outcome == "ok":
-        log.debug("FCM ping delivered")
+        # INFO (not debug): Render hides debug, and invisible deliveries
+        # cost a debug cycle — the device note is the only other proof.
+        log.info("FCM ping delivered")
     elif outcome == "stale":
         log.info("FCM stale token pruned")
         async with SessionLocal() as db:
