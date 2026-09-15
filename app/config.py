@@ -6,8 +6,45 @@ from pathlib import Path
 
 SERVER_ROOT = Path(__file__).resolve().parents[1]
 
+
+def _normalize_db_url(url: str) -> tuple[str, bool]:
+    """Make dashboard-pasted Postgres URLs async-engine-ready.
+
+    Neon/Render dashboards hand out libpq-shaped URLs (`postgresql://` +
+    `sslmode` / `channel_binding` params) but the async engine needs the
+    `postgresql+asyncpg` dialect, and asyncpg chokes on libpq-only params.
+    Returns (normalized_url, use_ssl). SQLite URLs pass through untouched.
+    """
+    scheme, sep, rest = url.partition("://")
+    if sep and "+" not in scheme and scheme in ("postgres", "postgresql"):
+        scheme = "postgresql+asyncpg"
+        url = scheme + "://" + rest
+    use_ssl = False
+    try:
+        from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+        parts = urlsplit(url)
+        if parts.scheme.startswith("postgresql"):
+            kept = []
+            for k, v in parse_qsl(parts.query, keep_blank_values=True):
+                if k == "sslmode":
+                    use_ssl = v.lower() != "disable"
+                elif k == "channel_binding":
+                    continue  # libpq-only; asyncpg rejects it
+                else:
+                    kept.append((k, v))
+            url = urlunsplit(
+                (parts.scheme, parts.netloc, parts.path, urlencode(kept), parts.fragment)
+            )
+    except Exception:
+        pass
+    return url, use_ssl
+
+
 # Postgres preferred (SPEC M4). SQLite fallback for local dev only.
-DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite+aiosqlite:///{SERVER_ROOT / 'visi.db'}")
+DATABASE_URL, DATABASE_USE_SSL = _normalize_db_url(
+    os.getenv("DATABASE_URL", f"sqlite+aiosqlite:///{SERVER_ROOT / 'visi.db'}")
+)
 
 # Sidecar CLI binary (B2: subprocess, NOT PyO3).
 _default_bin = SERVER_ROOT / "target" / "release" / (

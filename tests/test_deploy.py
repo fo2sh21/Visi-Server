@@ -65,6 +65,30 @@ def test_postgres_engine_disables_statement_cache(tmp_path, monkeypatch):
     assert dbmod.connect_args == {"statement_cache_size": 0}
 
 
+def test_neon_url_normalized_for_asyncpg():
+    """Dashboard-pasted libpq URLs become asyncpg-ready; TLS moves to ssl=True."""
+    import app.config as cfg
+
+    url, ssl = cfg._normalize_db_url(
+        "postgresql://u:p@host/db?sslmode=require&channel_binding=require"
+    )
+    assert url == "postgresql+asyncpg://u:p@host/db"
+    assert ssl is True
+
+    url, ssl = cfg._normalize_db_url("postgres://u:p@host/db")
+    assert url == "postgresql+asyncpg://u:p@host/db"
+    assert ssl is False
+
+    url, ssl = cfg._normalize_db_url(
+        "postgresql+asyncpg://u:p@host/db?sslmode=require"
+    )
+    assert url == "postgresql+asyncpg://u:p@host/db"
+    assert ssl is True
+
+    url, ssl = cfg._normalize_db_url("sqlite+aiosqlite:///x.db")
+    assert (url, ssl) == ("sqlite+aiosqlite:///x.db", False)
+
+
 def test_fcm_inline_json_wins_over_file(tmp_path, monkeypatch):
     """FCM_CREDENTIALS_JSON (Render/prod) takes precedence; file untouched."""
     gen = _mkclient(tmp_path, monkeypatch)

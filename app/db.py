@@ -11,8 +11,11 @@ if config.DATABASE_URL.startswith("sqlite"):
 else:
     # Neon pooled URL sits behind pgbouncer: prepared statements die on
     # pgbouncer, so asyncpg must not use its statement cache (deploy blocker
-    # per specs/render-deploy.md §2).
+    # per specs/render-deploy.md §2). ssl=True carries the stripped
+    # sslmode=require (Neon mandates TLS; publicly-trusted certs verify fine).
     connect_args = {"statement_cache_size": 0}
+    if config.DATABASE_USE_SSL:
+        connect_args["ssl"] = True
 
 engine = create_async_engine(
     config.DATABASE_URL,

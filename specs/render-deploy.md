@@ -51,7 +51,7 @@ instance, no disk (none needed — see §3).
 
 | Key | Value | Notes |
 |---|---|---|
-| `DATABASE_URL` | Neon pooled URL (`DATABASE_URL_POOLED`) | asyncpg + pgbouncer: set `statement_cache_size=0` in the engine (prepared statements die on pgbouncer otherwise) |
+| `DATABASE_URL` | Neon pooled URL (`DATABASE_URL_POOLED`), pasted verbatim | asyncpg + pgbouncer: code normalizes `postgresql://`→`+asyncpg`, strips libpq-only `sslmode`/`channel_binding` into `ssl=True`, and sets `statement_cache_size=0` (prepared statements die on pgbouncer otherwise) |
 | `UPDATE_BUCKET_BASE` | R2 public base (same as local `R2_DEV_URL` if that is the `r2.dev` download base; else the `pub-….r2.dev` URL) | feeds the `latest.json` reader (`ota-latest-json.md`) |
 | `FCM_CREDENTIALS_JSON` | service-account file content (§0) | required for push sends (`fcm-push.md`) |
 | `WS_TOKEN_TTL_DAYS` | `30` | locked cap |
