@@ -410,3 +410,101 @@ def test_rekey_routing(tmp_path, monkeypatch):
             time.sleep(0.5)
     assert _pending(dbmod, models) == []
     assert _pending(dbmod, models, "mallory") == []
+
+
+def test_typing_routed_live_only(tmp_path, monkeypatch):
+    """Typing start/stop routed verbatim to online peer; dropped offline."""
+    import json
+
+    gen = _mkclient(tmp_path, monkeypatch)
+    client, dbmod, models = next(gen)
+    raw_a, th_a = _tok(b"A" * 32)
+    raw_b, th_b = _tok(b"B" * 32)
+    _, th_m = _tok(b"M" * 32)
+    _seed(dbmod, models, [("alice", th_a), ("bob", th_b), ("mallory", th_m)], [])
+    hdr_a = {"authorization": f"Bearer {raw_a}"}
+    hdr_b = {"authorization": f"Bearer {raw_b}"}
+    with client.websocket_connect("/api/v1/ws", headers=hdr_a) as alice:
+        with client.websocket_connect("/api/v1/ws", headers=hdr_b) as bob:
+            alice.send_text(json.dumps({"type": "typing", "to": "bob", "state": "start"}))
+            assert json.loads(bob.receive_text()) == {
+                "type": "typing", "from": "alice", "to": "bob", "state": "start"}
+            alice.send_text(json.dumps({"type": "typing", "to": "bob", "state": "stop"}))
+            assert json.loads(bob.receive_text())["state"] == "stop"
+            # offline peer: dropped, nothing stored
+            alice.send_text(json.dumps({"type": "typing", "to": "mallory", "state": "start"}))
+            # invalid state / missing to: dropped
+            alice.send_text(json.dumps({"type": "typing", "to": "bob", "state": "maybe"}))
+            alice.send_text(json.dumps({"type": "typing", "state": "start"}))
+            time.sleep(0.5)
+    assert _pending(dbmod, models) == []
+
+    async def queue():
+        from sqlalchemy import select as _select
+
+        async with dbmod.SessionLocal() as db:
+            return list((await db.execute(_select(models.OfflineQueue))).scalars().all())
+
+    import asyncio
+
+    assert asyncio.run(queue()) == []
+
+
+def test_flush_sweeps_stale_queue_rows(tmp_path, monkeypatch):
+    """7d TTL: stale rows die on flush undelivered; fresh rows deliver."""
+    import time as _t
+
+    gen = _mkclient(tmp_path, monkeypatch)
+    client, dbmod, models = next(gen)
+    raw_b, th_b = _tok(b"B" * 32)
+    _seed(dbmod, models, [("bob", th_b)], [])
+    now = int(_t.time())
+
+    async def seed_q():
+        async with dbmod.SessionLocal() as db:
+            db.add(models.OfflineQueue(
+                msg_id="old", to_user="bob", from_user="alice",
+                envelope_b64="Y3Q=", created_at=now - 8 * 24 * 3600))
+            db.add(models.OfflineQueue(
+                msg_id="new", to_user="bob", from_user="alice",
+                envelope_b64="Y3Q=", created_at=now))
+            await db.commit()
+
+    import asyncio
+
+    asyncio.run(seed_q())
+    with client.websocket_connect(
+        "/api/v1/ws", headers={"authorization": f"Bearer {raw_b}"}
+    ) as bob:
+        assert '"new"' in bob.receive_text()
+        bob.send_text('{"type": "ack", "msg_id": "new"}')
+        time.sleep(0.5)
+    assert _get(dbmod, models, "old") is None  # shredded, never delivered
+    assert _get(dbmod, models, "new") is None  # acked
+
+
+def test_sweep_expired_queues_global(tmp_path, monkeypatch):
+    """Periodic sweep removes stale rows even for users who never return."""
+    import asyncio
+    import time as _t
+
+    import app.ws.relay as relay
+
+    gen = _mkclient(tmp_path, monkeypatch)
+    _, dbmod, models = next(gen)
+    now = int(_t.time())
+
+    async def seed_q():
+        async with dbmod.SessionLocal() as db:
+            db.add(models.OfflineQueue(
+                msg_id="dead", to_user="ghost", from_user="alice",
+                envelope_b64="Y3Q=", created_at=now - 8 * 24 * 3600))
+            db.add(models.OfflineQueue(
+                msg_id="live", to_user="ghost", from_user="alice",
+                envelope_b64="Y3Q=", created_at=now))
+            await db.commit()
+
+    asyncio.run(seed_q())
+    assert asyncio.run(relay.sweep_expired_queues()) == 1
+    assert _get(dbmod, models, "dead") is None
+    assert _get(dbmod, models, "live") is not None

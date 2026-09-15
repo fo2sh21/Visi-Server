@@ -1,6 +1,7 @@
 """FastAPI blind switchboard. No IP logging; TLS 1.3 at ingress."""
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -33,8 +34,35 @@ async def lifespan(app: FastAPI):
                     await conn2.execute(text(ddl))
             except Exception:
                 pass
-    yield
+    sweeper = asyncio.create_task(_sweep_loop())
+    try:
+        yield
+    finally:
+        # Join the sweeper so test harnesses and shutdown don't leak a
+        # pending 24h sleep (which hangs process teardown).
+        sweeper.cancel()
+        try:
+            await sweeper
+        except (asyncio.CancelledError, Exception):
+            pass
     await engine.dispose()
+
+
+async def _sweep_loop() -> None:
+    """Daily global shred of expired offline_queue rows (dead-forever
+    accounts). The keeper keeps the free instance awake enough for this to
+    run ~daily; returning users are additionally swept lazily on flush."""
+    while True:
+        await asyncio.sleep(24 * 3600)
+        try:
+            n = await relay.sweep_expired_queues()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.getLogger("uvicorn.error").exception("queue sweep failed")
+        else:
+            if n:
+                logging.getLogger("uvicorn.error").info("queue sweep removed %d", n)
 
 
 def create_app() -> FastAPI:

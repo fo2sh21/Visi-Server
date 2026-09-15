@@ -239,3 +239,58 @@ def test_fcm_payload_shape_and_outcomes(tmp_path, monkeypatch):
 
     monkeypatch.setattr(fcm, "_load", lambda: None)
     assert asyncio.run(fcm.send_ping("t")) == "error"  # no creds, no network
+
+
+def test_push_test_endpoint_states(tmp_path, monkeypatch):
+    """Self diagnostic: no-token / sent / stale(+pruned) / error / disabled."""
+    import asyncio
+
+    gen = _mkclient(tmp_path, monkeypatch)
+    client, dbmod, models, _, fcm = next(gen)
+    raw_a, th_a = _tok(b"A" * 32)
+    _seed(dbmod, models, [("alice", th_a)])
+
+    async def fake_ok(token):
+        return "ok"
+
+    async def fake_stale(token):
+        return "stale"
+
+    async def fake_error(token):
+        return "error"
+
+    # no token registered
+    r = client.post("/api/v1/push-test", headers=_hdr(raw_a))
+    assert r.json() == {"status": "no-token"}
+
+    client.post("/api/v1/push-token", headers=_hdr(raw_a),
+                json={"username": "alice", "fcm_token": "t1"})
+    # endpoint checks fcm._load() before send_ping: stub creds present
+    monkeypatch.setattr(fcm, "_load", lambda: (object(), "p"))
+    monkeypatch.setattr(fcm, "send_ping", fake_ok)
+    assert client.post("/api/v1/push-test", headers=_hdr(raw_a)).json() == {
+        "status": "sent"}
+
+    monkeypatch.setattr(fcm, "send_ping", fake_stale)
+    assert client.post("/api/v1/push-test", headers=_hdr(raw_a)).json() == {
+        "status": "stale"}
+    assert _rows(dbmod, models) == []  # stale pruned like the relay path
+
+    client.post("/api/v1/push-token", headers=_hdr(raw_a),
+                json={"username": "alice", "fcm_token": "t2"})
+    monkeypatch.setattr(fcm, "send_ping", fake_error)
+    assert client.post("/api/v1/push-test", headers=_hdr(raw_a)).json() == {
+        "status": "error"}
+
+    # creds missing entirely -> disabled (no network attempted)
+    monkeypatch.setattr(fcm, "_load", lambda: None)
+    fcm._creds.update(loaded=True, creds=None, project_id="")
+    assert client.post("/api/v1/push-test", headers=_hdr(raw_a)).json() == {
+        "status": "disabled"}
+    # no token + no creds is still no-token (registration checked first)
+    client.post("/api/v1/push-token/delete", headers=_hdr(raw_a),
+                json={"username": "alice"})
+    assert client.post("/api/v1/push-test", headers=_hdr(raw_a)).json() == {
+        "status": "no-token"}
+    # unauthenticated
+    assert client.post("/api/v1/push-test").status_code == 401

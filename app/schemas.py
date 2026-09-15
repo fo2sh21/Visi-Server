@@ -96,3 +96,9 @@ class PushTokenIn(BaseModel):
 
 class PushTokenDeleteIn(BaseModel):
     username: str = Field(pattern=r"^[a-zA-Z0-9_.\-]{3,32}$")
+
+
+class PushTestOut(BaseModel):
+    """Self diagnostic: sent | no-token | disabled | stale | error."""
+
+    status: str

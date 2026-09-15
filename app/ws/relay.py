@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import time
 import uuid
 
@@ -37,8 +38,13 @@ from ..fcm import send_ping as _fcm_ping
 
 router = APIRouter(tags=["ws"])
 
+log = logging.getLogger("uvicorn.error")
+
 ACK_TIMEOUT_SEC = 30
 RECEIPT_TTL_SEC = 30 * 24 * 3600
+# Server-side shred backstop: unacked message rows older than this die,
+# so dead-forever accounts can't accumulate queue storage without bound.
+QUEUE_TTL_SEC = 7 * 24 * 3600
 
 
 class Broker:
@@ -140,8 +146,19 @@ async def flush_queue(username: str) -> None:
 
     Durable receipts ride the same flush: lazy 30-day sweep for this user,
     then pending receipts oldest-first as {type, msg_id, receipt_id}.
-    Receipt rows die only on {type:ack, receipt_id} from the addressee."""
+    Receipt rows die only on {type:ack, receipt_id} from the addressee.
+
+    Server-side shred: this user's message rows older than QUEUE_TTL_SEC
+    (7d) die here too — recipients gone that long miss those messages."""
+    cutoff = int(time.time()) - QUEUE_TTL_SEC
     async with SessionLocal() as db:
+        await db.execute(
+            delete(models.OfflineQueue).where(
+                models.OfflineQueue.to_user == username,
+                models.OfflineQueue.created_at < cutoff,
+            )
+        )
+        await db.commit()
         res = await db.execute(
             select(models.OfflineQueue)
             .where(models.OfflineQueue.to_user == username)
@@ -175,6 +192,22 @@ async def flush_queue(username: str) -> None:
         )
 
 
+async def sweep_expired_queues() -> int:
+    """Global shred backstop: delete ALL message rows older than QUEUE_TTL_SEC.
+
+    The lazy per-user sweep in flush_queue covers returning recipients; this
+    covers dead-forever accounts that never reconnect. Idempotent DELETEs —
+    safe if a future second instance double-sweeps. Returns rows removed.
+    """
+    cutoff = int(time.time()) - QUEUE_TTL_SEC
+    async with SessionLocal() as db:
+        res = await db.execute(
+            delete(models.OfflineQueue).where(models.OfflineQueue.created_at < cutoff)
+        )
+        await db.commit()
+        return res.rowcount
+
+
 async def _store_receipt(to_user: str, kind: str, msg_id: str) -> None:
     """Durable backstop: persist a receipt until the addressee acks it.
 
@@ -196,18 +229,26 @@ async def _maybe_ping(to_user: str) -> None:
     Fire-and-forget from the send path — never blocks the relay. Stale
     (unregistered) tokens are deleted; anything else fails silent. The
     offline queue remains the source of truth; the token is never logged.
+    Outcomes are logged WITHOUT identifiers so Render logs show whether
+    push is flowing, stale, or dead (creds/network).
     """
     async with SessionLocal() as db:
         row = await db.get(models.PushToken, to_user)
         token = row.fcm_token if row else None
     if not token:
         return
-    if await _fcm_ping(token) == "stale":
+    outcome = await _fcm_ping(token)
+    if outcome == "ok":
+        log.debug("FCM ping delivered")
+    elif outcome == "stale":
+        log.info("FCM stale token pruned")
         async with SessionLocal() as db:
             row = await db.get(models.PushToken, to_user)
             if row is not None and row.fcm_token == token:
                 await db.delete(row)
                 await db.commit()
+    else:
+        log.warning("FCM ping failed (credentials or network?)")
 
 
 async def auth_token(token_b64: str) -> str | None:
@@ -318,6 +359,19 @@ async def ws_endpoint(ws: WebSocket):
                 await broker.push(
                     msg["to"], {"type": "rekey", "from": username, "to": msg["to"]}
                 )
+                continue
+            # Typing flicker: live-only, never stored — push-if-online, drop
+            # otherwise. A lost frame is a missed flicker, never stuck state
+            # (client clears on an 8s failsafe). Old clients without the typing
+            # branch fall through to envelope parsing inside try/catch — a log
+            # line, never a crash — and offline ones never see these at all.
+            if msg.get("type") == "typing" and msg.get("to"):
+                if msg.get("state") in ("start", "stop"):
+                    await broker.push(
+                        msg["to"],
+                        {"type": "typing", "from": username, "to": msg["to"],
+                         "state": msg["state"]},
+                    )
                 continue
             to_user, env, msg_id = msg.get("to"), msg.get("envelope_b64"), msg.get(
                 "msg_id", uuid.uuid4().hex
