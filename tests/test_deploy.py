@@ -149,7 +149,16 @@ def test_dockerfile_matches_spec():
     from pathlib import Path
 
     text = (Path(__file__).resolve().parents[1] / "Dockerfile").read_text()
-    for needle in ("rust:1.85-slim", "cargo build --release -p opaque-sidecar",
+    for needle in ("rust:slim", "cargo build --release -p opaque-sidecar",
                    "python:3.13-slim", "OPAQUE_SIDECAR_BIN=/srv/bin/opaque-sidecar",
                    "${PORT:-10000}"):
         assert needle in text, needle
+
+
+def test_image_has_websocket_transport():
+    """Uvicorn serves /ws only with websockets|wsproto installed (prod caught
+    missing while all green tests passed — TestClient has its own transport)."""
+    from pathlib import Path
+
+    reqs = (Path(__file__).resolve().parents[1] / "requirements.txt").read_text()
+    assert any(t in reqs for t in ("websockets", "wsproto", "uvicorn[standard]"))
