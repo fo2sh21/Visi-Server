@@ -8,6 +8,7 @@ HTTP status + FCM error status asserted here are what names the next one
 """
 import asyncio
 import logging
+import pathlib
 
 import pytest
 
@@ -197,3 +198,17 @@ def test_payload_is_data_only_high_priority(monkeypatch):
     assert "notification" not in msg
     assert sent["headers"] == {"Authorization": "Bearer AT"}
     assert sent["url"].endswith("/v1/projects/proj/messages:send")
+
+
+def test_requirements_pins_requests():
+    """Deployment contract: fcm.py uses google.auth.transport.requests,
+    which hard-requires the requests package. It happened to exist in dev
+    site-packages as a transitive dep, so only Render's clean pip install
+    exposed the gap — every ping died in OAuth with ImportError. An import
+    test would pass locally and prove nothing; pin the file instead."""
+    req = pathlib.Path(__file__).resolve().parent.parent / "requirements.txt"
+    lines = [ln.strip().lower() for ln in req.read_text().splitlines()]
+    assert any(
+        ln == "requests" or ln.startswith("requests==") or ln.startswith("requests>=")
+        for ln in lines
+    ), "requirements.txt must pin requests for the FCM OAuth transport"

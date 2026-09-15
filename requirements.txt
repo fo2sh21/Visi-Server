@@ -8,6 +8,7 @@ pydantic
 cryptography
 google-auth
 httpx
+requests
 pytest
 pytest-asyncio
 anyio
