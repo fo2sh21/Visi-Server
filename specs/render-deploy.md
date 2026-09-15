@@ -25,7 +25,9 @@ Render builds on Linux — the Windows `opaque-sidecar.exe` in this folder
 cannot run there. Build the sidecar inside the image:
 
 ```dockerfile
-FROM rust:1.85-slim AS rustbuild
+# Build stage floats latest stable slim: lockfile transitive deps (askama /
+# cargo_metadata via uniffi) keep raising MSRV past pinned toolchains.
+FROM rust:slim AS rustbuild
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY core-crypto ./core-crypto

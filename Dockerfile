@@ -1,6 +1,10 @@
 # ---- Rust: build the OPAQUE sidecar (Render builds on Linux; the Windows
 # opaque-sidecar.exe in this folder cannot run there) ----
-FROM rust:1.85-slim AS rustbuild
+# NOTE: floating `slim` (latest stable), NOT a pinned old toolchain: the
+# lockfile's transitive deps (askama / cargo_metadata via uniffi) keep
+# raising their MSRV (1.91+ as of 2026), which broke rust:1.85-slim.
+# Reproducibility still comes from Cargo.lock (compiler floats forward only).
+FROM rust:slim AS rustbuild
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY core-crypto ./core-crypto
