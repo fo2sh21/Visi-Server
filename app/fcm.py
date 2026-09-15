@@ -100,7 +100,16 @@ async def send_ping(fcm_token: str) -> str:
             r = await http.post(
                 url,
                 headers={"Authorization": f"Bearer {access}"},
-                json={"message": {"token": fcm_token, "data": {"ping": "true"}}},
+                # HIGH priority: without it Doze batches/defer data messages
+                # and the headless drain may never wake in time. Priority is
+                # delivery urgency, not user visibility (still data-only).
+                json={
+                    "message": {
+                        "token": fcm_token,
+                        "data": {"ping": "true"},
+                        "android": {"priority": "HIGH"},
+                    }
+                },
             )
     except Exception:
         return "error"
