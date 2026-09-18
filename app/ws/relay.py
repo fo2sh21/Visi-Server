@@ -362,6 +362,19 @@ async def ws_endpoint(ws: WebSocket):
                     msg["to"], {"type": "rekey", "from": username, "to": msg["to"]}
                 )
                 continue
+            # Heal request (Lane 0 Session 2): "I just reconnected — replay
+            # anything of mine you still hold for our thread." Live-only,
+            # never stored — exactly like rekey. A missed heal self-heals:
+            # the requester re-sends on its next reconnect, and its own
+            # outbox drain + backfill already ran. Old clients without the
+            # heal branch fall through to envelope parsing inside try/catch
+            # (a log line, never a crash); old servers drop heal frames and
+            # new clients degrade to self-heal.
+            if msg.get("type") == "heal" and msg.get("to"):
+                await broker.push(
+                    msg["to"], {"type": "heal", "from": username, "to": msg["to"]}
+                )
+                continue
             # Decrypt-failed NACK: the receiver stored our message but no
             # session generation opens it. Live-route if the sender is online;
             # otherwise a DURABLE receipt so the sender heals on next connect

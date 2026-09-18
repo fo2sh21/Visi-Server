@@ -412,6 +412,30 @@ def test_rekey_routing(tmp_path, monkeypatch):
     assert _pending(dbmod, models, "mallory") == []
 
 
+def test_heal_routing(tmp_path, monkeypatch):
+    """Heal: live-only push-if-online, silent drop offline, no storage."""
+    import json
+
+    gen = _mkclient(tmp_path, monkeypatch)
+    client, dbmod, models = next(gen)
+    raw_a, th_a = _tok(b"A" * 32)
+    raw_b, th_b = _tok(b"B" * 32)
+    _, th_m = _tok(b"M" * 32)
+    _seed(dbmod, models, [("alice", th_a), ("bob", th_b), ("mallory", th_m)], [])
+    hdr_a = {"authorization": f"Bearer {raw_a}"}
+    hdr_b = {"authorization": f"Bearer {raw_b}"}
+    with client.websocket_connect("/api/v1/ws", headers=hdr_a) as alice:
+        with client.websocket_connect("/api/v1/ws", headers=hdr_b) as bob:
+            bob.send_text(json.dumps({"type": "heal", "to": "alice"}))
+            assert json.loads(alice.receive_text()) == {
+                "type": "heal", "from": "bob", "to": "alice"}
+            bob.send_text(json.dumps({"type": "heal", "to": "mallory"}))  # offline
+            bob.send_text(json.dumps({"type": "heal"}))  # malformed
+            time.sleep(0.5)
+    assert _pending(dbmod, models) == []
+    assert _pending(dbmod, models, "mallory") == []
+
+
 def test_typing_routed_live_only(tmp_path, monkeypatch):
     """Typing start/stop routed verbatim to online peer; dropped offline."""
     import json
