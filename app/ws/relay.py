@@ -22,8 +22,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import ipaddress
 import json
 import logging
+import os
+import socket
 import time
 import uuid
 
@@ -266,9 +269,45 @@ async def auth_token(token_b64: str) -> str | None:
         return row.username
 
 
+# D-browser proxy egress guard (P0): the relay dials ONLY global-unicast
+# web ports. Without this, any authed client (or stolen token) turns the
+# relay into an open proxy: cloud metadata (169.254.169.254), internal
+# ranges, loopback services, and non-web ports (SMTP spam from OUR IP).
+# Resolve-then-validate on EVERY open (no cached verdicts across opens, so
+# DNS-rebinding at a later open re-validates). PROXY_ALLOW_PRIVATE=1 skips
+# ALL rules for the loopback echo harness (tests only — never set in
+# prod). Ports are still shape-validated (int, 1-65535) before this.
+PROXY_PORTS = (80, 443)
+
+
+async def _proxy_target_allowed(host: str, port: int) -> bool:
+    # Test harness escape hatch (loopback echo servers live on ephemeral
+    # ports): skips BOTH rules. Tests only — never set in prod.
+    if os.environ.get("PROXY_ALLOW_PRIVATE") == "1":
+        return True
+    if port not in PROXY_PORTS:
+        return False
+    try:
+        # Loop-backed DNS: never blocks the event loop on resolution.
+        infos = await asyncio.get_running_loop().getaddrinfo(
+            host, port, type=socket.SOCK_STREAM)
+    except Exception:
+        return False
+    addrs = {sa[0] for _, _, _, _, sa in infos}
+    if not addrs:
+        return False
+    for a in addrs:
+        try:
+            ip = ipaddress.ip_address(a)
+        except ValueError:
+            return False
+        if not ip.is_global:
+            return False
+    return True
+
+
 @router.websocket("/api/v1/ws")
-async def ws_endpoint(ws: WebSocket):
-    # R1: header-only. Tokens in URLs leak into proxy/uvicorn logs;
+async def ws_endpoint(ws: WebSocket):   # R1: header-only. Tokens in URLs leak into proxy/uvicorn logs;
     # native app has no browser constraint justifying ?token=.
     auth = ws.headers.get("authorization", "")
     scheme, _, token = auth.partition(" ")
@@ -280,6 +319,32 @@ async def ws_endpoint(ws: WebSocket):
         await ws.close(code=4401)
         return
     await broker.connect(username, ws)
+    # D-browser proxy: per-connection upstream sessions keyed by the
+    # client-generated stream id. Local to this socket (the proxy WS is a
+    # dedicated connection, separate from chat) — dies with the connection.
+    proxy_sessions: dict = {}
+
+    async def _proxy_pump(sid: str, reader: asyncio.StreamReader) -> None:
+        """Upstream -> WS duplex half. Dumb bytes, never logged/inspected."""
+        try:
+            while True:
+                chunk = await reader.read(16 * 1024)
+                if not chunk:
+                    break
+                await broker.push(
+                    username,
+                    {"type": "proxy-data", "id": sid,
+                     "chunk_b64": base64.b64encode(chunk).decode()},
+                )
+        except Exception:
+            pass
+        # Upstream EOF/error: tell the client the stream is dead
+        # (fail-closed) so it never hangs on a half-open id.
+        try:
+            await broker.push(username, {"type": "proxy-close", "id": sid})
+        except Exception:
+            pass
+
     async with SessionLocal() as db:
         now = int(time.time())
         row = await db.get(models.Presence, username)
@@ -375,6 +440,85 @@ async def ws_endpoint(ws: WebSocket):
                     msg["to"], {"type": "heal", "from": username, "to": msg["to"]}
                 )
                 continue
+            # D-browser proxy-open: dial is reachable ONLY after the Bearer
+            # handshake above (pre-dial by construction — no new auth code).
+            # Fail-closed: refused/unresolvable dial -> proxy-close, never an
+            # error string (exception text can carry the hostname — it is
+            # neither sent nor logged). Destinations are never logged.
+            if msg.get("type") == "proxy-open":
+                sid = msg.get("id")
+                host = msg.get("host")
+                port = msg.get("port")
+                if (
+                    not isinstance(sid, str) or not sid or len(sid) > 128
+                    or not isinstance(host, str) or not host or len(host) > 253
+                    or isinstance(port, bool) or not isinstance(port, int)
+                    or not (1 <= port <= 65535)
+                    or sid in proxy_sessions
+                ):
+                    continue
+                # Egress guard: non-global IPs and non-web ports are refused
+                # with proxy-close (fail-closed WITH signal — silent drops
+                # would hang the client; the id alone leaks nothing).
+                if not await _proxy_target_allowed(host, port):
+                    try:
+                        await broker.push(username, {"type": "proxy-close", "id": sid})
+                    except Exception:
+                        pass
+                    continue
+                try:
+                    reader, writer = await asyncio.open_connection(host, port)
+                except Exception:
+                    try:
+                        await broker.push(username, {"type": "proxy-close", "id": sid})
+                    except Exception:
+                        pass
+                    continue
+                pump = asyncio.create_task(_proxy_pump(sid, reader))
+                proxy_sessions[sid] = (writer, pump)
+                continue
+            # D-browser proxy-data: dumb pipe chunk into the upstream socket.
+            # Oversized/undecodable chunks are silently dropped (never cut).
+            if msg.get("type") == "proxy-data":
+                sid = msg.get("id")
+                chunk_b64 = msg.get("chunk_b64")
+                entry = proxy_sessions.get(sid) if isinstance(sid, str) else None
+                if entry is None or not isinstance(chunk_b64, str):
+                    continue
+                try:
+                    chunk = base64.b64decode(chunk_b64, validate=True)
+                except Exception:
+                    continue
+                if not chunk or len(chunk) > 16 * 1024:
+                    continue
+                writer, pump = entry
+                try:
+                    writer.write(chunk)
+                    await writer.drain()
+                except Exception:
+                    proxy_sessions.pop(sid, None)
+                    pump.cancel()
+                    try:
+                        writer.close()
+                    except Exception:
+                        pass
+                    try:
+                        await broker.push(username, {"type": "proxy-close", "id": sid})
+                    except Exception:
+                        pass
+                continue
+            # D-browser proxy-close: kill one stream; unknown ids are no-ops.
+            if msg.get("type") == "proxy-close":
+                sid = msg.get("id")
+                entry = proxy_sessions.pop(sid, None) if isinstance(sid, str) else None
+                if entry is not None:
+                    writer, pump = entry
+                    pump.cancel()
+                    try:
+                        writer.close()
+                    except Exception:
+                        pass
+                continue
             # Decrypt-failed NACK: the receiver stored our message but no
             # session generation opens it. Live-route if the sender is online;
             # otherwise a DURABLE receipt so the sender heals on next connect
@@ -454,6 +598,15 @@ async def ws_endpoint(ws: WebSocket):
         import anyio
 
         with anyio.CancelScope(shield=True):
+            # D-browser proxy: kill every upstream session with the socket —
+            # cancel pumps first, then close writers (generic, never logged).
+            for _sid, (_w, _pump) in list(proxy_sessions.items()):
+                _pump.cancel()
+                try:
+                    _w.close()
+                except Exception:
+                    pass
+            proxy_sessions.clear()
             await broker.disconnect(username, ws)
             async with SessionLocal() as db:
                 row = await db.get(models.Presence, username)
