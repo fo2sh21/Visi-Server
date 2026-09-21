@@ -280,6 +280,15 @@ async def auth_token(token_b64: str) -> str | None:
 PROXY_PORTS = (80, 443)
 
 
+# D-browser proxy counters (counts CLASSES only — never hosts, ports,
+# payloads, or users). The only proxy observability that exists, by design:
+# stream opens/ends plus dial-failure classes. Logged at warning on dial
+# failure (the diagnosable event), counted silently otherwise.
+proxy_stats = {"open": 0, "refused": 0, "ended": 0,
+               "dial_dns": 0, "dial_refused": 0, "dial_timeout": 0,
+               "dial_other": 0}
+
+
 async def _proxy_target_allowed(host: str, port: int) -> bool:
     # Test harness escape hatch (loopback echo servers live on ephemeral
     # ports): skips BOTH rules. Tests only — never set in prod.
@@ -338,6 +347,7 @@ async def ws_endpoint(ws: WebSocket):   # R1: header-only. Tokens in URLs leak i
                 )
         except Exception:
             pass
+        proxy_stats["ended"] += 1
         # Upstream EOF/error: tell the client the stream is dead
         # (fail-closed) so it never hangs on a half-open id.
         try:
@@ -461,6 +471,7 @@ async def ws_endpoint(ws: WebSocket):   # R1: header-only. Tokens in URLs leak i
                 # with proxy-close (fail-closed WITH signal — silent drops
                 # would hang the client; the id alone leaks nothing).
                 if not await _proxy_target_allowed(host, port):
+                    proxy_stats["refused"] += 1
                     try:
                         await broker.push(username, {"type": "proxy-close", "id": sid})
                     except Exception:
@@ -468,12 +479,25 @@ async def ws_endpoint(ws: WebSocket):   # R1: header-only. Tokens in URLs leak i
                     continue
                 try:
                     reader, writer = await asyncio.open_connection(host, port)
-                except Exception:
+                except Exception as e:
+                    # Class-only diagnosis (exception text can carry the
+                    # hostname — it is neither sent nor logged).
+                    if isinstance(e, socket.gaierror):
+                        suffix = "dns"
+                    elif isinstance(e, ConnectionRefusedError):
+                        suffix = "refused"
+                    elif isinstance(e, (asyncio.TimeoutError, TimeoutError)):
+                        suffix = "timeout"
+                    else:
+                        suffix = "other"
+                    proxy_stats["dial_" + suffix] += 1
+                    log.warning("proxy dial failed: %s", suffix)
                     try:
                         await broker.push(username, {"type": "proxy-close", "id": sid})
                     except Exception:
                         pass
                     continue
+                proxy_stats["open"] += 1
                 pump = asyncio.create_task(_proxy_pump(sid, reader))
                 proxy_sessions[sid] = (writer, pump)
                 continue
@@ -512,6 +536,7 @@ async def ws_endpoint(ws: WebSocket):   # R1: header-only. Tokens in URLs leak i
                 sid = msg.get("id")
                 entry = proxy_sessions.pop(sid, None) if isinstance(sid, str) else None
                 if entry is not None:
+                    proxy_stats["ended"] += 1
                     writer, pump = entry
                     pump.cancel()
                     try:

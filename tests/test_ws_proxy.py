@@ -326,3 +326,37 @@ def test_proxy_egress_guard(tmp_path, monkeypatch):
     finally:
         srv.shutdown()
         srv.server_close()
+
+
+def test_proxy_counters(tmp_path, monkeypatch):
+    """Count-only observability: opens, refused dials, stream ends."""
+    import app.ws.relay as relay_mod
+
+    gen = _mkclient(tmp_path, monkeypatch)
+    client, dbmod, models = next(gen)
+    raw, th = _tok(b"H" * 32)
+    _seed(dbmod, models, [("alice", th)])
+    dead = _closed_port()
+    srv, port = _start_echo()
+    try:
+        with client.websocket_connect(
+            "/api/v1/ws", headers={"authorization": f"Bearer {raw}"}
+        ) as ws:
+            base_open = relay_mod.proxy_stats["open"]
+            base_refused = relay_mod.proxy_stats["dial_refused"]
+            base_ended = relay_mod.proxy_stats["ended"]
+            _open(ws, "c1", "127.0.0.1", port)
+            _data(ws, "c1", b"ping")
+            assert _recv_proxy(ws)["type"] == "proxy-data"
+            ws.send_text(json.dumps({"type": "proxy-close", "id": "c1"}))
+            time.sleep(0.3)
+            # Refused dial (nothing listening) counts by class.
+            _open(ws, "c2", "127.0.0.1", dead)
+            assert _recv_proxy(ws) == {"type": "proxy-close", "id": "c2"}
+            time.sleep(0.3)
+            assert relay_mod.proxy_stats["open"] == base_open + 1
+            assert relay_mod.proxy_stats["dial_refused"] == base_refused + 1
+            assert relay_mod.proxy_stats["ended"] >= base_ended + 1
+    finally:
+        srv.shutdown()
+        srv.server_close()
