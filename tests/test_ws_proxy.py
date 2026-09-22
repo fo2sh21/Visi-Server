@@ -328,6 +328,39 @@ def test_proxy_egress_guard(tmp_path, monkeypatch):
         srv.server_close()
 
 
+def test_proxy_dial_timeout(tmp_path, monkeypatch):
+    """Blackholed dial -> proxy-close fast + dial_timeout class (P1).
+
+    Hangs only the probe host (delegates everything else), with a short
+    timeout override so the suite stays fast. Uses TEST-NET-2 with
+    PROXY_ALLOW_PRIVATE=1 (egress guard skipped, dial attempted).
+    """
+    import app.ws.relay as relay_mod
+
+    gen = _mkclient(tmp_path, monkeypatch)
+    client, dbmod, models = next(gen)
+    raw, th = _tok(b"V" * 32)
+    _seed(dbmod, models, [("alice", th)])
+    monkeypatch.setattr(relay_mod, "PROXY_DIAL_TIMEOUT_S", 0.3)
+    real_open = asyncio.open_connection
+
+    async def hanging_open(host, port, **kw):
+        if host == "203.0.113.99":
+            await asyncio.sleep(5)
+        return await real_open(host, port, **kw)
+
+    monkeypatch.setattr(asyncio, "open_connection", hanging_open)
+    with client.websocket_connect(
+        "/api/v1/ws", headers={"authorization": f"Bearer {raw}"}
+    ) as ws:
+        base_timeout = relay_mod.proxy_stats["dial_timeout"]
+        start = time.monotonic()
+        _open(ws, "stall", "203.0.113.99", 443)
+        assert _recv_proxy(ws) == {"type": "proxy-close", "id": "stall"}
+        assert time.monotonic() - start < 5
+        assert relay_mod.proxy_stats["dial_timeout"] == base_timeout + 1
+
+
 def test_proxy_counters(tmp_path, monkeypatch):
     """Count-only observability: opens, refused dials, stream ends."""
     import app.ws.relay as relay_mod

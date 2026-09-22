@@ -279,6 +279,10 @@ async def auth_token(token_b64: str) -> str | None:
 # prod). Ports are still shape-validated (int, 1-65535) before this.
 PROXY_PORTS = (80, 443)
 
+# D-browser dial timeout (P1): a blackholed SYN must never hang a stream
+# forever. The wait_for below maps to the existing dial_timeout class.
+PROXY_DIAL_TIMEOUT_S = 10.0
+
 
 # D-browser proxy counters (counts CLASSES only — never hosts, ports,
 # payloads, or users). The only proxy observability that exists, by design:
@@ -478,7 +482,10 @@ async def ws_endpoint(ws: WebSocket):   # R1: header-only. Tokens in URLs leak i
                         pass
                     continue
                 try:
-                    reader, writer = await asyncio.open_connection(host, port)
+                    reader, writer = await asyncio.wait_for(
+                        asyncio.open_connection(host, port),
+                        timeout=PROXY_DIAL_TIMEOUT_S,
+                    )
                 except Exception as e:
                     # Class-only diagnosis (exception text can carry the
                     # hostname — it is neither sent nor logged).
