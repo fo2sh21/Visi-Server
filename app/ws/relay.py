@@ -10,11 +10,12 @@ Delivery is at-least-once: unacked rows stay queued and are redelivered on
 reconnect. Client contract: dedup by msg_id; on an already-seen msg_id,
 re-send the ack but do NOT reprocess the envelope (else redeliveries loop).
 Acks are idempotent. Only an ack from the owning recipient deletes a row.
-Ticks: the ack triggers a best-effort {"type": "delivered"} push to the
-original sender when online; when offline, a durable pending-delivered row
-is stored instead and flushed on reconnect (same lifecycle as messages:
-stored only until acknowledged, never archived). Read receipts to offline
-targets are likewise stored. Rekey nudges stay live-only, never stored.
+Ticks: the ack triggers a DURABLE pending-delivered row first, then a
+live {"type": "delivered"} push when the sender is online (R3 S1b —
+the tick can no longer be lost to a dead socket; the row flushes on
+next connect and dies on receipt_id-ack). Read/NACK/decrypted receipts
+are likewise stored-first, pushed-live-second. Rekey nudges stay
+live-only, never stored.
 Tick-state sync on reconnect is therefore complete for senders back within
 30 days (older pending receipts are lazily swept on flush).
 """
@@ -47,7 +48,10 @@ ACK_TIMEOUT_SEC = 30
 RECEIPT_TTL_SEC = 30 * 24 * 3600
 # Server-side shred backstop: unacked message rows older than this die,
 # so dead-forever accounts can't accumulate queue storage without bound.
-QUEUE_TTL_SEC = 7 * 24 * 3600
+# R3 S4: 30 days (was 7) to match receipts — a month offline still
+# delivers; storage stays bounded (ciphertext rows, swept lazily here
+# and globally).
+QUEUE_TTL_SEC = 30 * 24 * 3600
 
 
 class Broker:
@@ -80,16 +84,40 @@ class Broker:
     def is_online(self, username: str) -> bool:
         return bool(self.online.get(username))
 
+    async def discard(self, ws: WebSocket) -> str | None:
+        """Drop one socket from every user's set. Returns the owning user,
+        or None if it was already gone. Callers fix presence afterwards."""
+        async with self.lock:
+            for user, conns in list(self.online.items()):
+                if ws in conns:
+                    conns.discard(ws)
+                    if not conns:
+                        self.online.pop(user, None)
+                    return user
+        return None
+
     async def push(self, username: str, payload: dict) -> bool:
+        # R3 S1a prune-on-failure: a socket that throws is dead (half-open
+        # mobile sockets never clean-close). It is discarded immediately so
+        # is_online() stops lying — a lying presence loses receipts (they
+        # route "live" into the void) AND suppresses the FCM doorbell.
         async with self.lock:
             targets = list(self.online.get(username, ()))
         ok = False
+        dead: list = []
         for ws in targets:
             try:
                 await ws.send_text(json.dumps(payload))
                 ok = True
             except Exception:
-                continue
+                dead.append(ws)
+        pruned: list[str] = []
+        for ws in dead:
+            user = await self.discard(ws)
+            if user is not None:
+                pruned.append(user)
+        for user in pruned:
+            asyncio.create_task(_mark_offline_if_gone(user))
         return ok
 
     def expect_ack(self, username: str, msg_id: str) -> asyncio.Event:
@@ -112,6 +140,19 @@ class Broker:
 
 
 broker = Broker()
+
+
+async def _mark_offline_if_gone(username: str) -> None:
+    """R3 S1a: presence truth repair. Called after any socket prune and on
+    clean disconnect: if the user holds no live sockets, flip the Presence
+    row offline (re-arms the FCM doorbell). Fire-and-forget safe."""
+    if broker.is_online(username):
+        return
+    async with SessionLocal() as db:
+        row = await db.get(models.Presence, username)
+        if row is not None and row.online:
+            row.online, row.last_seen = False, int(time.time())
+            await db.commit()
 
 
 async def _delete_msg(msg_id: str, to_user: str) -> None:
@@ -170,9 +211,13 @@ async def flush_queue(username: str) -> None:
         )
         rows = list(res.scalars().all())
     for r in rows:
-        await broker.push(
+        # R3 S1c: stop at the first dead push — the socket died mid-flush.
+        # Unacked rows stay queued (DELETE-on-ack only); next connect
+        # resumes. Firing 100 rows into a corpse was pure exception spam.
+        if not await broker.push(
             username, {"from": r.from_user, "envelope_b64": r.envelope_b64, "msg_id": r.msg_id}
-        )
+        ):
+            break
     cutoff = int(time.time()) - RECEIPT_TTL_SEC
     async with SessionLocal() as db:
         await db.execute(
@@ -190,9 +235,11 @@ async def flush_queue(username: str) -> None:
         )
         receipts = list(res.scalars().all())
     for p in receipts:
-        await broker.push(
+        # R3 S1c: same break-on-death for the receipt lane.
+        if not await broker.push(
             username, {"type": p.kind, "msg_id": p.msg_id, "receipt_id": p.id}
-        )
+        ):
+            break
 
 
 async def sweep_expired_queues() -> int:
@@ -211,19 +258,32 @@ async def sweep_expired_queues() -> int:
         return res.rowcount
 
 
-async def _store_receipt(to_user: str, kind: str, msg_id: str) -> None:
+async def _store_receipt(to_user: str, kind: str, msg_id: str) -> str | None:
     """Durable backstop: persist a receipt until the addressee acks it.
 
     Same lifecycle as messages (stored only until acknowledged, never
     archived). Dedup-guarded by UNIQUE(to_user, kind, msg_id) — duplicate
-    acks/reads collapse into one row (IntegrityError -> ignore). Never logged.
+    acks/reads collapse into one row (IntegrityError -> return the
+    EXISTING row's id so live pushes still carry a receipt_id). Never
+    logged. Returns the receipt row id, or None if nothing is stored.
     """
     async with SessionLocal() as db:
-        db.add(models.PendingReceipt(to_user=to_user, kind=kind, msg_id=msg_id))
+        row = models.PendingReceipt(to_user=to_user, kind=kind, msg_id=msg_id)
+        db.add(row)
         try:
             await db.commit()
+            return row.id
         except IntegrityError:
             await db.rollback()
+            res = await db.execute(
+                select(models.PendingReceipt).where(
+                    models.PendingReceipt.to_user == to_user,
+                    models.PendingReceipt.kind == kind,
+                    models.PendingReceipt.msg_id == msg_id,
+                )
+            )
+            prow = res.scalars().first()
+            return prow.id if prow is not None else None
 
 
 async def _maybe_ping(to_user: str) -> None:
@@ -331,7 +391,13 @@ async def ws_endpoint(ws: WebSocket):   # R1: header-only. Tokens in URLs leak i
     if username is None:
         await ws.close(code=4401)
         return
-    await broker.connect(username, ws)
+    try:
+        await broker.connect(username, ws)
+    except (WebSocketDisconnect, RuntimeError):
+        # R3 S2 ghost hygiene: TCP accepted but the handshake never
+        # completed (dead-on-arrival mobile sockets). Quiet return — no
+        # state was registered, there is nothing to clean.
+        return
     # D-browser proxy: per-connection upstream sessions keyed by the
     # client-generated stream id. Local to this socket (the proxy WS is a
     # dedicated connection, separate from chat) — dies with the connection.
@@ -385,9 +451,11 @@ async def ws_endpoint(ws: WebSocket):   # R1: header-only. Tokens in URLs leak i
                         await db.delete(row)
                         await db.commit()
                 continue
-            # Message acks: {type: ack, msg_id} -> live tick if the sender is
-            # online, durable pending-delivered row if offline. Duplicate acks
-            # re-push the identical tick (client dedups by msg_id).
+            # Message acks: {type: ack, msg_id} -> the sender gets a durable
+            # pending-delivered row FIRST, then a live tick if online (R3
+            # S1b durable-first: the tick can no longer be lost to a dead
+            # socket — the row survives and flushes on next connect).
+            # Duplicate acks re-push the identical tick (client dedups).
             if msg.get("type") == "ack" and msg.get("msg_id"):
                 broker.resolve_ack(username, msg["msg_id"])
                 sender = await _pop_sender(msg["msg_id"], username)
@@ -413,25 +481,25 @@ async def ws_endpoint(ws: WebSocket):   # R1: header-only. Tokens in URLs leak i
                                 await db.commit()
                         continue
                 if sender != username:
+                    rid = await _store_receipt(sender, "delivered", msg["msg_id"])
                     if broker.is_online(sender):
-                        await broker.push(
-                            sender,
-                            {"type": "delivered", "msg_id": msg["msg_id"], "to": sender},
-                        )
-                    else:
-                        await _store_receipt(sender, "delivered", msg["msg_id"])
+                        tick: dict = {
+                            "type": "delivered", "msg_id": msg["msg_id"], "to": sender}
+                        if rid is not None:
+                            tick["receipt_id"] = rid
+                        await broker.push(sender, tick)
                 continue
-            # Read receipts: live route if online, durable backstop if offline.
+            # Read receipts: durable row first, live push if online (R3 S1b).
             if msg.get("type") == "read" and msg.get("msg_id"):
                 target = msg.get("to", "")
                 if target:
+                    rid = await _store_receipt(target, "read", msg["msg_id"])
                     if broker.is_online(target):
-                        await broker.push(
-                            target,
-                            {"type": "read", "from": username, "msg_id": msg["msg_id"]},
-                        )
-                    else:
-                        await _store_receipt(target, "read", msg["msg_id"])
+                        frame: dict = {
+                            "type": "read", "from": username, "msg_id": msg["msg_id"]}
+                        if rid is not None:
+                            frame["receipt_id"] = rid
+                        await broker.push(target, frame)
                 continue
             # Rekey nudge: live-only, never stored — push-if-online, drop
             # otherwise. A missed nudge self-heals: the sender's next send to
@@ -552,48 +620,46 @@ async def ws_endpoint(ws: WebSocket):   # R1: header-only. Tokens in URLs leak i
                         pass
                 continue
             # Decrypt-failed NACK: the receiver stored our message but no
-            # session generation opens it. Live-route if the sender is online;
-            # otherwise a DURABLE receipt so the sender heals on next connect
-            # (deduped by UNIQUE(to_user, kind, msg_id) like read receipts).
+            # session generation opens it. Durable row first, live push if
+            # the sender is online (R3 S1b — a NACK into a dead socket used
+            # to vanish and strand the message forever). Deduped by
+            # UNIQUE(to_user, kind, msg_id) like read receipts.
             # Flushed without "from" — the sender resolves the thread from
             # their own row by msg_id. Sender-stamped here, never trusted
             # from the wire.
             if msg.get("type") == "decrypt-failed" and msg.get("msg_id"):
                 target = msg.get("to", "")
                 if target:
+                    rid = await _store_receipt(target, "decrypt-failed", msg["msg_id"])
                     if broker.is_online(target):
-                        await broker.push(
-                            target,
-                            {
-                                "type": "decrypt-failed",
-                                "from": username,
-                                "msg_id": msg["msg_id"],
-                            },
-                        )
-                    else:
-                        await _store_receipt(target, "decrypt-failed", msg["msg_id"])
+                        frame: dict = {
+                            "type": "decrypt-failed",
+                            "from": username,
+                            "msg_id": msg["msg_id"],
+                        }
+                        if rid is not None:
+                            frame["receipt_id"] = rid
+                        await broker.push(target, frame)
                 continue
             # Track R truthful ticks: the receiver DECRYPTED (not just
-            # stored) our message. Same lifecycle as decrypt-failed —
-            # live-route if the sender is online, else a DURABLE receipt
-            # so ✓✓ converges on next connect (deduped by
-            # UNIQUE(to_user, kind, msg_id)). Flushed without "from" —
-            # the sender resolves the thread from their own row by msg_id.
-            # Old senders ignore the unknown type (log line, never crash).
+            # stored) our message. Durable row first, live push if the
+            # sender is online (R3 S1b, same lifecycle as decrypt-failed).
+            # Flushed without "from" — the sender resolves the thread from
+            # their own row by msg_id. Old senders ignore the unknown type
+            # (log line, never crash).
             if msg.get("type") == "decrypted" and msg.get("msg_id"):
                 target = msg.get("to", "")
                 if target:
+                    rid = await _store_receipt(target, "decrypted", msg["msg_id"])
                     if broker.is_online(target):
-                        await broker.push(
-                            target,
-                            {
-                                "type": "decrypted",
-                                "from": username,
-                                "msg_id": msg["msg_id"],
-                            },
-                        )
-                    else:
-                        await _store_receipt(target, "decrypted", msg["msg_id"])
+                        frame2: dict = {
+                            "type": "decrypted",
+                            "from": username,
+                            "msg_id": msg["msg_id"],
+                        }
+                        if rid is not None:
+                            frame2["receipt_id"] = rid
+                        await broker.push(target, frame2)
                 continue
             # Typing flicker: live-only, never stored — push-if-online, drop
             # otherwise. A lost frame is a missed flicker, never stuck state
@@ -625,6 +691,15 @@ async def ws_endpoint(ws: WebSocket):   # R1: header-only. Tokens in URLs leak i
                     )
                 )
                 await db.commit()
+            # R3 S3 server-held ack: the sender's transport now KNOWS the
+            # row is committed (closes the radio-buffer micro-gap where
+            # tick-1 was shown but the bytes never left the phone).
+            # Best-effort, no lifecycle: unknown type to old clients (log
+            # line, never crash), never acked, never stored.
+            try:
+                await ws.send_text(json.dumps({"type": "stored", "msg_id": msg_id}))
+            except Exception:
+                pass
             # FCM doorbell for offline recipients (fire-and-forget task: a
             # slow FCM must never stall the relay). Online recipients drain
             # via the socket below; a redundant ping on a connect race is
@@ -643,7 +718,9 @@ async def ws_endpoint(ws: WebSocket):   # R1: header-only. Tokens in URLs leak i
                         pass  # row stays queued for redelivery on reconnect
                     else:
                         await _delete_msg(msg_id, to_user)
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, RuntimeError):
+        # R3 S2: RuntimeError covers ghost sockets that died before/without
+        # the WS handshake completing ("Need to call accept first" spam).
         pass
     finally:
         # Shielded cleanup: teardown can arrive as task cancellation (client
@@ -662,8 +739,4 @@ async def ws_endpoint(ws: WebSocket):   # R1: header-only. Tokens in URLs leak i
                     pass
             proxy_sessions.clear()
             await broker.disconnect(username, ws)
-            async with SessionLocal() as db:
-                row = await db.get(models.Presence, username)
-                if row is not None and not broker.is_online(username):
-                    row.online, row.last_seen = False, int(time.time())
-                    await db.commit()
+            await _mark_offline_if_gone(username)

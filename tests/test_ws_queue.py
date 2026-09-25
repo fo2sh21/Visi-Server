@@ -158,7 +158,8 @@ def test_query_token_rejected(tmp_path, monkeypatch):
 
 
 def test_delivered_tick_happy_path(tmp_path, monkeypatch):
-    """Ack triggers {"type":"delivered"} to the online original sender."""
+    """Ack stores a durable delivered row first, then live-ticks the online
+    sender with a receipt_id; receipt-ack consumes the row (R3 S1b)."""
     import json
 
     gen = _mkclient(tmp_path, monkeypatch)
@@ -175,8 +176,13 @@ def test_delivered_tick_happy_path(tmp_path, monkeypatch):
             assert '"m10"' in bob.receive_text()  # flush
             bob.send_text('{"type": "ack", "msg_id": "m10"}')
             tick = json.loads(alice.receive_text())
-            assert tick == {"type": "delivered", "msg_id": "m10", "to": "alice"}
+            assert tick["type"] == "delivered" and tick["msg_id"] == "m10"
+            assert tick["to"] == "alice" and "receipt_id" in tick
+            alice.send_text(json.dumps(
+                {"type": "ack", "receipt_id": tick["receipt_id"]}))
+            time.sleep(0.5)
     assert _get(dbmod, models, "m10") is None  # row hard-deleted
+    assert _pending(dbmod, models, "alice") == []  # tick row consumed
 
 
 def test_delivered_missed_when_sender_offline(tmp_path, monkeypatch):
@@ -198,7 +204,9 @@ def test_delivered_missed_when_sender_offline(tmp_path, monkeypatch):
 
 
 def test_duplicate_ack_repushes_identical_tick(tmp_path, monkeypatch):
-    """Duplicate acks re-push the same payload; row stays gone (idempotent)."""
+    """Duplicate acks re-push the same tick payload; row stays gone (idempotent).
+    R3 S1b: ticks carry receipt_id; the re-push stores a fresh row and the
+    receipt-ack consumes it."""
     import json
 
     gen = _mkclient(tmp_path, monkeypatch)
@@ -214,12 +222,21 @@ def test_duplicate_ack_repushes_identical_tick(tmp_path, monkeypatch):
         with client.websocket_connect("/api/v1/ws", headers=hdr_b) as bob:
             assert '"m12"' in bob.receive_text()
             bob.send_text('{"type": "ack", "msg_id": "m12"}')
-            assert json.loads(alice.receive_text()) == {
-                "type": "delivered", "msg_id": "m12", "to": "alice"}
+            first = json.loads(alice.receive_text())
+            assert first["type"] == "delivered" and first["msg_id"] == "m12"
+            assert "receipt_id" in first
+            alice.send_text(json.dumps(
+                {"type": "ack", "receipt_id": first["receipt_id"]}))
+            time.sleep(0.3)
             bob.send_text('{"type": "ack", "msg_id": "m12"}')  # dup
-            assert json.loads(alice.receive_text()) == {
-                "type": "delivered", "msg_id": "m12", "to": "alice"}
+            second = json.loads(alice.receive_text())
+            assert second["type"] == "delivered" and second["msg_id"] == "m12"
+            assert "receipt_id" in second
+            alice.send_text(json.dumps(
+                {"type": "ack", "receipt_id": second["receipt_id"]}))
+            time.sleep(0.5)
     assert _get(dbmod, models, "m12") is None
+    assert _pending(dbmod, models, "alice") == []
 
 
 def test_offline_sender_delivered_persists_and_flushes(tmp_path, monkeypatch):
@@ -279,7 +296,7 @@ def test_read_to_offline_persists_and_flushes(tmp_path, monkeypatch):
 
 
 def test_online_paths_write_no_rows(tmp_path, monkeypatch):
-    """Both ends online: live tick + live read, zero pending rows."""
+    """Both ends online: live tick + live read, rows consumed via receipt acks."""
     import json
 
     gen = _mkclient(tmp_path, monkeypatch)
@@ -295,15 +312,24 @@ def test_online_paths_write_no_rows(tmp_path, monkeypatch):
         with client.websocket_connect("/api/v1/ws", headers=hdr_b) as bob:
             assert '"m22"' in bob.receive_text()
             bob.send_text('{"type": "ack", "msg_id": "m22"}')
-            assert json.loads(alice.receive_text())["type"] == "delivered"
+            tick = json.loads(alice.receive_text())
+            assert tick["type"] == "delivered"
+            alice.send_text(json.dumps(
+                {"type": "ack", "receipt_id": tick["receipt_id"]}))
             bob.send_text(json.dumps({"type": "read", "to": "alice", "msg_id": "m22"}))
-            assert json.loads(alice.receive_text()) == {
-                "type": "read", "from": "bob", "msg_id": "m22"}
+            read = json.loads(alice.receive_text())
+            assert read == {
+                "type": "read", "from": "bob", "msg_id": "m22",
+                "receipt_id": read["receipt_id"]}
+            alice.send_text(json.dumps(
+                {"type": "ack", "receipt_id": read["receipt_id"]}))
+            time.sleep(0.5)
     assert _pending(dbmod, models) == []
 
 
 def test_decrypted_online_live_no_rows(tmp_path, monkeypatch):
-    """Track R: decrypted to an online sender pushes live, writes nothing."""
+    """Track R: decrypted to an online sender pushes live; the receipt-ack
+    consumes the durable row (R3 S1b store-first)."""
     import json
 
     gen = _mkclient(tmp_path, monkeypatch)
@@ -317,8 +343,13 @@ def test_decrypted_online_live_no_rows(tmp_path, monkeypatch):
         with client.websocket_connect("/api/v1/ws", headers=hdr_b) as bob:
             bob.send_text(json.dumps(
                 {"type": "decrypted", "to": "alice", "msg_id": "m40"}))
-            assert json.loads(alice.receive_text()) == {
-                "type": "decrypted", "from": "bob", "msg_id": "m40"}
+            frame = json.loads(alice.receive_text())
+            assert frame == {
+                "type": "decrypted", "from": "bob", "msg_id": "m40",
+                "receipt_id": frame["receipt_id"]}
+            alice.send_text(json.dumps(
+                {"type": "ack", "receipt_id": frame["receipt_id"]}))
+            time.sleep(0.5)
     assert _pending(dbmod, models) == []
 
 
@@ -537,7 +568,7 @@ def test_typing_routed_live_only(tmp_path, monkeypatch):
 
 
 def test_flush_sweeps_stale_queue_rows(tmp_path, monkeypatch):
-    """7d TTL: stale rows die on flush undelivered; fresh rows deliver."""
+    """30d TTL (R3 S4): stale rows die on flush undelivered; fresh deliver."""
     import time as _t
 
     gen = _mkclient(tmp_path, monkeypatch)
@@ -550,7 +581,7 @@ def test_flush_sweeps_stale_queue_rows(tmp_path, monkeypatch):
         async with dbmod.SessionLocal() as db:
             db.add(models.OfflineQueue(
                 msg_id="old", to_user="bob", from_user="alice",
-                envelope_b64="Y3Q=", created_at=now - 8 * 24 * 3600))
+                envelope_b64="Y3Q=", created_at=now - 31 * 24 * 3600))
             db.add(models.OfflineQueue(
                 msg_id="new", to_user="bob", from_user="alice",
                 envelope_b64="Y3Q=", created_at=now))
@@ -569,6 +600,68 @@ def test_flush_sweeps_stale_queue_rows(tmp_path, monkeypatch):
     assert _get(dbmod, models, "new") is None  # acked
 
 
+def test_broker_prunes_dead_socket_on_push_failure(tmp_path, monkeypatch):
+    """R3 S1a: a socket that throws is discarded from `online` so presence
+    stops lying (dead sockets used to eat receipts + suppress FCM)."""
+    import asyncio
+
+    gen = _mkclient(tmp_path, monkeypatch)
+    client, dbmod, models = next(gen)
+    import app.ws.relay as relay
+
+    class Dead:
+        async def send_text(self, payload):
+            raise RuntimeError("dead")
+
+    class Live:
+        def __init__(self):
+            self.got = []
+
+        async def send_text(self, payload):
+            self.got.append(payload)
+
+    async def go():
+        b = relay.Broker()
+        dead, live = Dead(), Live()
+        b.online["u"] = {dead, live}
+        assert await b.push("u", {"x": 1}) is True
+        assert len(live.got) == 1
+        assert b.is_online("u")  # live socket keeps the user online
+        assert dead not in b.online["u"]
+        # Kill the live one too: user fully pruned.
+        live2 = Dead()
+        b.online["u"] = {live2}
+        assert await b.push("u", {"x": 2}) is False
+        assert not b.is_online("u")
+        await asyncio.sleep(0)  # let the presence fix-up tasks settle
+
+    asyncio.run(go())
+
+
+def test_stored_ack_on_insert(tmp_path, monkeypatch):
+    """R3 S3: every committed message frame is answered with a server-held
+    `stored` ack on the sender's socket (best-effort, no lifecycle)."""
+    import base64 as _b64
+    import json
+
+    gen = _mkclient(tmp_path, monkeypatch)
+    client, dbmod, models = next(gen)
+    raw_a, th_a = _tok(b"A" * 32)
+    _seed(dbmod, models, [("alice", th_a)], [])
+    with client.websocket_connect(
+        "/api/v1/ws", headers={"authorization": f"Bearer {raw_a}"}
+    ) as alice:
+        alice.send_text(json.dumps({
+            "type": "x", "to": "bob",
+            "envelope_b64": _b64.b64encode(b"ct").decode(),
+            "msg_id": "m50"}))
+        # Note: unknown "type" still routes by to/envelope (message path
+        # keys on fields, not type) — the stored ack keys on msg_id.
+        frame = json.loads(alice.receive_text())
+        assert frame == {"type": "stored", "msg_id": "m50"}
+    assert _get(dbmod, models, "m50") is not None  # queued for bob
+
+
 def test_sweep_expired_queues_global(tmp_path, monkeypatch):
     """Periodic sweep removes stale rows even for users who never return."""
     import asyncio
@@ -584,7 +677,7 @@ def test_sweep_expired_queues_global(tmp_path, monkeypatch):
         async with dbmod.SessionLocal() as db:
             db.add(models.OfflineQueue(
                 msg_id="dead", to_user="ghost", from_user="alice",
-                envelope_b64="Y3Q=", created_at=now - 8 * 24 * 3600))
+                envelope_b64="Y3Q=", created_at=now - 31 * 24 * 3600))
             db.add(models.OfflineQueue(
                 msg_id="live", to_user="ghost", from_user="alice",
                 envelope_b64="Y3Q=", created_at=now))
