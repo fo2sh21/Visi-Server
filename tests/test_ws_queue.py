@@ -302,6 +302,68 @@ def test_online_paths_write_no_rows(tmp_path, monkeypatch):
     assert _pending(dbmod, models) == []
 
 
+def test_decrypted_online_live_no_rows(tmp_path, monkeypatch):
+    """Track R: decrypted to an online sender pushes live, writes nothing."""
+    import json
+
+    gen = _mkclient(tmp_path, monkeypatch)
+    client, dbmod, models = next(gen)
+    raw_a, th_a = _tok(b"A" * 32)
+    raw_b, th_b = _tok(b"B" * 32)
+    _seed(dbmod, models, [("alice", th_a), ("bob", th_b)], [])
+    hdr_a = {"authorization": f"Bearer {raw_a}"}
+    hdr_b = {"authorization": f"Bearer {raw_b}"}
+    with client.websocket_connect("/api/v1/ws", headers=hdr_a) as alice:
+        with client.websocket_connect("/api/v1/ws", headers=hdr_b) as bob:
+            bob.send_text(json.dumps(
+                {"type": "decrypted", "to": "alice", "msg_id": "m40"}))
+            assert json.loads(alice.receive_text()) == {
+                "type": "decrypted", "from": "bob", "msg_id": "m40"}
+    assert _pending(dbmod, models) == []
+
+
+def test_decrypted_to_offline_persists_and_flushes(tmp_path, monkeypatch):
+    """Track R: decrypted to an offline sender is stored, flushed, acked."""
+    import json
+
+    gen = _mkclient(tmp_path, monkeypatch)
+    client, dbmod, models = next(gen)
+    raw_a, th_a = _tok(b"A" * 32)
+    raw_b, th_b = _tok(b"B" * 32)
+    _seed(dbmod, models, [("alice", th_a), ("bob", th_b)], [])
+    hdr_a = {"authorization": f"Bearer {raw_a}"}
+    hdr_b = {"authorization": f"Bearer {raw_b}"}
+    with client.websocket_connect("/api/v1/ws", headers=hdr_b) as bob:
+        bob.send_text(json.dumps(
+            {"type": "decrypted", "to": "alice", "msg_id": "m41"}))
+        time.sleep(0.5)
+    rows = _pending(dbmod, models, "alice")
+    assert [(r.kind, r.msg_id) for r in rows] == [("decrypted", "m41")]
+    with client.websocket_connect("/api/v1/ws", headers=hdr_a) as alice:
+        frame = json.loads(alice.receive_text())
+        assert frame == {
+            "type": "decrypted", "msg_id": "m41",
+            "receipt_id": frame["receipt_id"]}
+        alice.send_text(json.dumps(
+            {"type": "ack", "receipt_id": frame["receipt_id"]}))
+        time.sleep(0.5)
+    assert _pending(dbmod, models, "alice") == []
+
+
+def test_decrypted_missing_to_noop(tmp_path, monkeypatch):
+    """Track R: decrypted without a target is dropped, never crashes."""
+    gen = _mkclient(tmp_path, monkeypatch)
+    client, dbmod, models = next(gen)
+    raw_b, th_b = _tok(b"B" * 32)
+    _seed(dbmod, models, [("bob", th_b)], [])
+    with client.websocket_connect(
+        "/api/v1/ws", headers={"authorization": f"Bearer {raw_b}"}
+    ) as bob:
+        bob.send_text('{"type": "decrypted", "msg_id": "m42"}')
+        time.sleep(0.5)
+    assert _pending(dbmod, models) == []
+
+
 def test_live_tick_ack_does_not_eat_pending_read(tmp_path, monkeypatch):
     """Plain msg_id ack consumes only kind=delivered rows — pending read safe."""
     gen = _mkclient(tmp_path, monkeypatch)

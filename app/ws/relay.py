@@ -573,6 +573,28 @@ async def ws_endpoint(ws: WebSocket):   # R1: header-only. Tokens in URLs leak i
                     else:
                         await _store_receipt(target, "decrypt-failed", msg["msg_id"])
                 continue
+            # Track R truthful ticks: the receiver DECRYPTED (not just
+            # stored) our message. Same lifecycle as decrypt-failed —
+            # live-route if the sender is online, else a DURABLE receipt
+            # so ✓✓ converges on next connect (deduped by
+            # UNIQUE(to_user, kind, msg_id)). Flushed without "from" —
+            # the sender resolves the thread from their own row by msg_id.
+            # Old senders ignore the unknown type (log line, never crash).
+            if msg.get("type") == "decrypted" and msg.get("msg_id"):
+                target = msg.get("to", "")
+                if target:
+                    if broker.is_online(target):
+                        await broker.push(
+                            target,
+                            {
+                                "type": "decrypted",
+                                "from": username,
+                                "msg_id": msg["msg_id"],
+                            },
+                        )
+                    else:
+                        await _store_receipt(target, "decrypted", msg["msg_id"])
+                continue
             # Typing flicker: live-only, never stored — push-if-online, drop
             # otherwise. A lost frame is a missed flicker, never stuck state
             # (client clears on an 8s failsafe). Old clients without the typing
